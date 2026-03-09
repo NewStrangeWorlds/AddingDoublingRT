@@ -1,4 +1,4 @@
-/// @file phase_matrix.h
+/// @file phase_matrix.hpp
 /// @brief Azimuthally-averaged phase matrix construction from Legendre coefficients.
 ///
 /// Provides both fixed-size (template) and dynamic-size implementations.

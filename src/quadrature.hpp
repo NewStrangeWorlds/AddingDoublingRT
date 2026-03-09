@@ -1,4 +1,4 @@
-/// @file quadrature.h
+/// @file quadrature.hpp
 /// @brief Gauss-Legendre quadrature and Legendre polynomial utilities.
 
 #pragma once

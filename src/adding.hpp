@@ -1,4 +1,4 @@
-/// @file adding.h
+/// @file adding.hpp
 /// @brief Adding algorithm: combine two layers into a composite layer.
 
 #pragma once

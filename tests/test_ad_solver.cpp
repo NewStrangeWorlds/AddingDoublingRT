@@ -13,11 +13,12 @@
 
 #include "testing.hpp"
 #include "adding_doubling.hpp"
+#include "constants.hpp"
 
 #include <cmath>
 #include <vector>
 
-static constexpr double PI = 3.14159265358979323846;
+static constexpr double PI = adrt::PI;
 
 
 // ============================================================================
@@ -1541,4 +1542,301 @@ TEST(ADSolver, DiffusionBC_DynamicPath) {
     EXPECT_FALSE(std::isnan(r.flux_down[l]));
     EXPECT_GT(r.flux_up[l], 0.0);
   }
+}
+
+
+// ============================================================================
+//  Regression: Validate is called by solver
+// ============================================================================
+
+TEST(ADSolver, SolveRejectsInvalidConfig) {
+  // solve() should throw for invalid configurations.
+  adrt::ADConfig cfg(0, 8);  // num_layers = 0
+  EXPECT_THROW(adrt::solve(cfg), std::invalid_argument);
+}
+
+TEST(ADSolver, SolveRejectsNegativeTau) {
+  adrt::ADConfig cfg(1, 8);
+  cfg.allocate();
+  cfg.delta_tau[0] = -1.0;
+  EXPECT_THROW(adrt::solve(cfg), std::invalid_argument);
+}
+
+
+// ============================================================================
+//  Regression: Workspace reuse produces identical results
+// ============================================================================
+
+TEST(ADSolver, WorkspaceReuse) {
+  // solve() with and without a SolverWorkspace should give identical results.
+  adrt::ADConfig cfg(3, 8);
+  cfg.solar_flux = 1.0;
+  cfg.solar_mu = 0.5;
+  cfg.surface_albedo = 0.2;
+  cfg.allocate();
+
+  for (int l = 0; l < 3; ++l) {
+    cfg.delta_tau[l] = 0.5;
+    cfg.single_scat_albedo[l] = 0.9;
+  }
+  cfg.setHenyeyGreenstein(0.7);
+
+  auto r1 = adrt::solve(cfg);
+
+  adrt::SolverWorkspace ws;
+  auto r2 = adrt::solve(cfg, ws);
+
+  for (int l = 0; l <= 3; ++l) {
+    EXPECT_NEAR(r1.flux_up[l], r2.flux_up[l], 1e-14);
+    EXPECT_NEAR(r1.flux_down[l], r2.flux_down[l], 1e-14);
+    EXPECT_NEAR(r1.flux_direct[l], r2.flux_direct[l], 1e-14);
+    EXPECT_NEAR(r1.mean_intensity[l], r2.mean_intensity[l], 1e-14);
+  }
+
+  // Calling solve again with the same workspace should also match.
+  auto r3 = adrt::solve(cfg, ws);
+
+  for (int l = 0; l <= 3; ++l) {
+    EXPECT_NEAR(r1.flux_up[l], r3.flux_up[l], 1e-14);
+    EXPECT_NEAR(r1.flux_down[l], r3.flux_down[l], 1e-14);
+  }
+}
+
+
+// ============================================================================
+//  Regression: index_from_bottom reversal
+// ============================================================================
+
+TEST(ADSolver, IndexFromBottom) {
+  // Results with index_from_bottom should be the reverse of the default.
+  adrt::ADConfig cfg_top(3, 8);
+  cfg_top.solar_flux = 1.0;
+  cfg_top.solar_mu = 0.5;
+  cfg_top.surface_albedo = 0.1;
+  cfg_top.allocate();
+
+  cfg_top.delta_tau[0] = 0.1;  cfg_top.single_scat_albedo[0] = 0.5;
+  cfg_top.delta_tau[1] = 0.5;  cfg_top.single_scat_albedo[1] = 0.9;
+  cfg_top.delta_tau[2] = 1.0;  cfg_top.single_scat_albedo[2] = 0.3;
+  cfg_top.setIsotropic();
+
+  auto r_top = adrt::solve(cfg_top);
+
+  // Build equivalent config indexed from bottom.
+  adrt::ADConfig cfg_bot(3, 8);
+  cfg_bot.index_from_bottom = true;
+  cfg_bot.solar_flux = 1.0;
+  cfg_bot.solar_mu = 0.5;
+  cfg_bot.surface_albedo = 0.1;
+  cfg_bot.allocate();
+
+  // Reversed layer order
+  cfg_bot.delta_tau[0] = 1.0;  cfg_bot.single_scat_albedo[0] = 0.3;
+  cfg_bot.delta_tau[1] = 0.5;  cfg_bot.single_scat_albedo[1] = 0.9;
+  cfg_bot.delta_tau[2] = 0.1;  cfg_bot.single_scat_albedo[2] = 0.5;
+  cfg_bot.setIsotropic();
+
+  auto r_bot = adrt::solve(cfg_bot);
+
+  // r_bot[0] should correspond to r_top[3] (BOA), etc.
+  for (int l = 0; l <= 3; ++l) {
+    EXPECT_NEAR(r_top.flux_up[l], r_bot.flux_up[3 - l], 1e-12);
+    EXPECT_NEAR(r_top.flux_down[l], r_bot.flux_down[3 - l], 1e-12);
+    EXPECT_NEAR(r_top.flux_direct[l], r_bot.flux_direct[3 - l], 1e-12);
+    EXPECT_NEAR(r_top.mean_intensity[l], r_bot.mean_intensity[3 - l], 1e-12);
+  }
+}
+
+
+// ============================================================================
+//  Regression: Mixed atmosphere (thermal + solar, mixed phase functions)
+// ============================================================================
+
+TEST(ADSolver, MixedAtmosphere) {
+  // 3-layer atmosphere with mixed phase functions, thermal + solar sources.
+  // Rayleigh top, forward-scattering cloud middle, absorbing gas bottom.
+  adrt::ADConfig cfg(3, 8);
+  cfg.surface_albedo = 0.1;
+  cfg.solar_flux = 0.01;
+  cfg.solar_mu = 0.7;
+  cfg.allocate();
+
+  cfg.delta_tau[0] = 0.1;  cfg.single_scat_albedo[0] = 0.95;
+  cfg.setRayleigh(0);
+
+  cfg.delta_tau[1] = 2.0;  cfg.single_scat_albedo[1] = 0.99;
+  cfg.setDoubleHenyeyGreenstein(0.8, 0.7, -0.3, 1);
+
+  cfg.delta_tau[2] = 0.5;  cfg.single_scat_albedo[2] = 0.1;
+  cfg.setIsotropic(2);
+
+  // Thermal source via raw planck_levels
+  cfg.planck_levels = {1.0, 2.0, 3.0, 3.0};
+  cfg.surface_emission = 4.0;
+
+  auto r = adrt::solve(cfg);
+
+  // All fluxes finite and non-negative
+  for (int l = 0; l <= 3; ++l) {
+    EXPECT_FALSE(std::isnan(r.flux_up[l]));
+    EXPECT_FALSE(std::isnan(r.flux_down[l]));
+    EXPECT_FALSE(std::isnan(r.flux_direct[l]));
+    EXPECT_FALSE(std::isnan(r.mean_intensity[l]));
+    EXPECT_GT(r.mean_intensity[l], 0.0);
+  }
+
+  // Direct beam should attenuate downward
+  EXPECT_GT(r.flux_direct[0], r.flux_direct[3]);
+
+  // Upward flux at BOA should be positive (surface emission + albedo)
+  EXPECT_GT(r.flux_up[3], 0.0);
+}
+
+
+// ============================================================================
+//  Regression: Quadrature convergence
+// ============================================================================
+
+TEST(ADSolver, QuadratureConvergence) {
+  // For a fixed problem, increasing quadrature order should converge.
+  // Check that nquad=16 and nquad=32 agree better than nquad=4 and nquad=32.
+  double f_up_4 = 0.0, f_up_16 = 0.0, f_up_32 = 0.0;
+
+  for (int nq : {4, 16, 32}) {
+    adrt::ADConfig cfg(1, nq);
+    cfg.surface_emission = 2.0;
+    cfg.allocate();
+    cfg.delta_tau[0] = 1.0;
+    cfg.single_scat_albedo[0] = 0.9;
+    cfg.planck_levels = {1.0, 1.0};
+    cfg.setHenyeyGreenstein(0.8);
+
+    auto r = adrt::solve(cfg);
+
+    if (nq == 4) f_up_4 = r.flux_up[0];
+    else if (nq == 16) f_up_16 = r.flux_up[0];
+    else f_up_32 = r.flux_up[0];
+  }
+
+  double diff_4_32  = std::abs(f_up_4 - f_up_32);
+  double diff_16_32 = std::abs(f_up_16 - f_up_32);
+  EXPECT_LT(diff_16_32, diff_4_32);
+}
+
+
+// ============================================================================
+//  Regression: Rayleigh spherical albedo
+// ============================================================================
+
+TEST(ADSolver, RayleighSphericalAlbedo) {
+  // For conservative Rayleigh scattering with overhead sun and black surface,
+  // the spherical albedo A = F_up(TOA) / (F_solar * mu0).
+  // For tau=0.5, omega=1, this is a well-known benchmark value.
+  int nlay = 10;
+  double total_tau = 0.5;
+
+  adrt::ADConfig cfg(nlay, 16);
+  cfg.solar_flux = 1.0;
+  cfg.solar_mu = 1.0;
+  cfg.surface_albedo = 0.0;
+  cfg.allocate();
+
+  for (int l = 0; l < nlay; ++l) {
+    cfg.delta_tau[l] = total_tau / nlay;
+    cfg.single_scat_albedo[l] = 1.0;
+  }
+  cfg.setRayleigh();
+
+  auto r = adrt::solve(cfg);
+
+  double albedo = r.flux_up[0] / (cfg.solar_flux * cfg.solar_mu);
+
+  // Spherical albedo for tau=0.5, conservative Rayleigh, overhead sun.
+  // Multi-layer discretisation gives ~0.20. Check reasonable bounds.
+  EXPECT_GT(albedo, 0.15);
+  EXPECT_LT(albedo, 0.25);
+
+  // Energy conservation: net flux constant for omega=1
+  double fnet0 = r.flux_up[0] - r.flux_down[0] - r.flux_direct[0];
+  double fnetN = r.flux_up[nlay] - r.flux_down[nlay] - r.flux_direct[nlay];
+  EXPECT_NEAR(fnet0, fnetN, 1e-5);
+}
+
+
+// ============================================================================
+//  Regression: Double Henyey-Greenstein phase function moments
+// ============================================================================
+
+TEST(ADConfig, DoubleHenyeyGreensteinMoments) {
+  adrt::ADConfig cfg(1, 4);
+  cfg.allocate();
+  double f = 0.7, g1 = 0.8, g2 = -0.3;
+  cfg.setDoubleHenyeyGreenstein(f, g1, g2);
+
+  // chi_k = f * g1^k + (1-f) * g2^k
+  for (int k = 0; k < static_cast<int>(cfg.phase_function_moments[0].size()); ++k) {
+    double expected = f * std::pow(g1, k) + (1.0 - f) * std::pow(g2, k);
+    EXPECT_NEAR(cfg.phase_function_moments[0][k], expected, 1e-14);
+  }
+}
+
+
+// ============================================================================
+//  Regression: Dynamic path matches fixed-size path
+// ============================================================================
+
+TEST(ADSolver, DynamicMatchesFixedSize) {
+  // nquad=8 uses the fixed-size template path. Solve the same problem with
+  // nquad=8 and compare against a nearby dynamic nquad (6 or 10) to confirm
+  // they converge to similar answers for this well-conditioned problem.
+  adrt::ADConfig cfg8(1, 8);
+  cfg8.solar_flux = 1.0;
+  cfg8.solar_mu = 0.5;
+  cfg8.surface_albedo = 0.0;
+  cfg8.allocate();
+  cfg8.delta_tau[0] = 0.5;
+  cfg8.single_scat_albedo[0] = 0.9;
+  cfg8.setIsotropic();
+
+  adrt::ADConfig cfg10(1, 10);  // dynamic path
+  cfg10.solar_flux = 1.0;
+  cfg10.solar_mu = 0.5;
+  cfg10.surface_albedo = 0.0;
+  cfg10.allocate();
+  cfg10.delta_tau[0] = 0.5;
+  cfg10.single_scat_albedo[0] = 0.9;
+  cfg10.setIsotropic();
+
+  auto r8 = adrt::solve(cfg8);
+  auto r10 = adrt::solve(cfg10);
+
+  // Both should give similar results (isotropic scattering converges quickly)
+  EXPECT_NEAR(r8.flux_up[0], r10.flux_up[0], 0.01 * r8.flux_up[0]);
+  EXPECT_NEAR(r8.flux_down[1], r10.flux_down[1], 0.01 * r8.flux_down[1]);
+}
+
+
+// ============================================================================
+//  Regression: Delta-M backward compatibility
+// ============================================================================
+
+TEST(ADSolver, DeltaM_BackwardCompat) {
+  // use_delta_m=false (default) should give identical results to an explicit
+  // false setting — verifying no accidental delta-M activation.
+  adrt::ADConfig cfg(1, 8);
+  cfg.surface_emission = 1.5;
+  cfg.allocate();
+  cfg.delta_tau[0] = 1.0;
+  cfg.single_scat_albedo[0] = 0.9;
+  cfg.planck_levels = {1.0, 2.0};
+  cfg.setHenyeyGreenstein(0.5);
+
+  auto r1 = adrt::solve(cfg);
+
+  adrt::ADConfig cfg2 = cfg;
+  cfg2.use_delta_m = false;
+  auto r2 = adrt::solve(cfg2);
+
+  EXPECT_NEAR(r1.flux_up[0], r2.flux_up[0], 1e-14);
+  EXPECT_NEAR(r1.flux_down[1], r2.flux_down[1], 1e-14);
 }

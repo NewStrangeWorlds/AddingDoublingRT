@@ -2,12 +2,11 @@
 /// @brief Gauss-Legendre quadrature and Legendre polynomial implementation.
 
 #include "quadrature.hpp"
+#include "constants.hpp"
 
 #include <cmath>
 
 namespace adrt {
-
-static constexpr double PI = 3.14159265358979323846;
 
 void gaussLegendre(
   int n,

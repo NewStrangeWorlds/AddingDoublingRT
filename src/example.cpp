@@ -4,12 +4,11 @@
 /// Compile:  g++ -std=c++17 -O2 -o example example.cpp adding_doubling.cpp
 
 #include "adding_doubling.hpp"
+#include "constants.hpp"
+
 #include <cmath>
 #include <iomanip>
 #include <iostream>
-
-
-static constexpr double PI = 3.14159265358979323846;
 
 /// Simple Planck function B_nu(T) at wavenumber nu [cm^-1] and temperature T [K].
 /// Returns spectral radiance in W cm^-2 sr^-1 / cm^-1.
@@ -305,8 +304,8 @@ void test_linear_source()
     double slope_term = mu[i] * one_minus_t - 0.5 * tau * (1.0 + trans);
     double I_up   = B_bar * one_minus_t + B_d * slope_term;
     double I_down = B_bar * one_minus_t - B_d * slope_term;
-    F_up_analytic   += 2.0 * PI * wt[i] * mu[i] * I_up;
-    F_down_analytic += 2.0 * PI * wt[i] * mu[i] * I_down;
+    F_up_analytic   += 2.0 * adrt::PI * wt[i] * mu[i] * I_up;
+    F_down_analytic += 2.0 * adrt::PI * wt[i] * mu[i] * I_down;
   }
 
   std::cout << "  Analytical:  " << std::setw(12) << F_up_analytic

@@ -24,8 +24,7 @@ struct SolverWorkspace {
   /// Get or compute Legendre polynomials P_l(mu_i) for l=0..L-1.
   /// Returns cached values if L and mu haven't changed since last call.
   const std::vector<std::vector<double>>& getLegendrePolynomials(
-      int L, const std::vector<double>& mu)
-  {
+      int L, const std::vector<double>& mu) {
     if (L == cached_L_ && mu == cached_mu_)
       return cached_Pl_;
 

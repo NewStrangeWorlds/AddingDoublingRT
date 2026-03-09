@@ -1,4 +1,4 @@
-/// @file matrix.h
+/// @file matrix.hpp
 /// @brief Dense NxN matrix classes for the adding-doubling RT solver.
 ///
 /// Provides both a fixed-size templated Matrix<N> (using Eigen fixed-size types

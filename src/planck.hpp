@@ -1,5 +1,5 @@
-/// @file planck.h
-/// @brief Planck function for the DART radiative transfer solver.
+/// @file planck.hpp
+/// @brief Planck function for the adding-doubling radiative transfer solver.
 
 #pragma once
 

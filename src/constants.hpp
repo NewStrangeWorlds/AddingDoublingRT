@@ -1,4 +1,4 @@
-/// @file constants.h
+/// @file constants.hpp
 /// @brief Shared constants for the DART radiative transfer solver.
 
 #pragma once

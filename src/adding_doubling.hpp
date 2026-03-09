@@ -1,4 +1,4 @@
-/// @file adding_doubling.h
+/// @file adding_doubling.hpp
 /// @brief Adding-doubling radiative transfer solver for plane-parallel atmospheres.
 ///
 /// Implements the matrix operator / adding-doubling method of

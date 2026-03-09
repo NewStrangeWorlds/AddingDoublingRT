@@ -1,4 +1,4 @@
-/// @file layer.h
+/// @file layer.hpp
 /// @brief Layer data structures for the adding-doubling RT solver.
 ///
 /// Holds the reflection/transmission matrices and source vectors for a single

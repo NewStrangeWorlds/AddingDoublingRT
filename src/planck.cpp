@@ -2,14 +2,13 @@
 /// @brief Planck function implementation (adapted from DisORT Planck.cpp).
 
 #include "planck.hpp"
+#include "constants.hpp"
 
 #include <cmath>
 #include <limits>
 #include <stdexcept>
 
 namespace adrt {
-
-static constexpr double PI = 3.14159265358979323846;
 
 namespace PlanckConstants 
 {

@@ -1,4 +1,4 @@
-/// @file doubling.h
+/// @file doubling.hpp
 /// @brief Doubling algorithm: compute R, T, source vectors for a single
 ///        homogeneous layer via iterative doubling.
 
