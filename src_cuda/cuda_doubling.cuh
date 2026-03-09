@@ -18,8 +18,8 @@ namespace cuda {
 /// Adaptive number of initial doublings based on single-scattering albedo.
 __device__ __forceinline__ int compute_ipow0(float omega) {
   if (omega < 0.01f) return 4;
-  if (omega < 0.1f)  return 10;
-  return 16;
+  if (omega < 0.1f)  return 8;
+  return 12;
 }
 
 /// Doubling algorithm for a single homogeneous layer.
