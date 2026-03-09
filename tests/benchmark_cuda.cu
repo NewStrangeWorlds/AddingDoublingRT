@@ -22,10 +22,10 @@ struct TestAtmosphere {
   int nmu;
   int nmom;
 
-  std::vector<double> delta_tau;    // [nwav * nlay]
-  std::vector<double> ssa;          // [nwav * nlay]
-  std::vector<double> pmom;         // [nlay * nmom] (shared)
-  std::vector<double> planck;       // [nwav * nlev]
+  std::vector<float> delta_tau;    // [nwav * nlay]
+  std::vector<float> ssa;          // [nwav * nlay]
+  std::vector<float> pmom;         // [nlay * nmom] (shared)
+  std::vector<float> planck;       // [nwav * nlev]
 };
 
 TestAtmosphere buildAtmosphere(int nlay, int nwav, int nmu, int nmom) {
@@ -39,7 +39,7 @@ TestAtmosphere buildAtmosphere(int nlay, int nwav, int nmu, int nmom) {
 
   atm.delta_tau.resize(nwav * nlay);
   atm.ssa.resize(nwav * nlay);
-  atm.pmom.resize(nlay * nmom, 0.0);
+  atm.pmom.resize(nlay * nmom, 0.0f);
   atm.planck.resize(nwav * nlev);
 
   // Henyey-Greenstein g=0.7 moments: chi[l] = g^l
@@ -47,7 +47,7 @@ TestAtmosphere buildAtmosphere(int nlay, int nwav, int nmu, int nmom) {
   for (int l = 0; l < nlay; ++l) {
     double gl = 1.0;
     for (int m = 0; m < nmom; ++m) {
-      atm.pmom[l * nmom + m] = gl;
+      atm.pmom[l * nmom + m] = static_cast<float>(gl);
       gl *= g;
     }
   }
@@ -59,9 +59,9 @@ TestAtmosphere buildAtmosphere(int nlay, int nwav, int nmu, int nmom) {
     for (int l = 0; l < nlay; ++l) {
       double lfrac = static_cast<double>(l) / nlay;
       // Optical depth increases with depth, varies with wavenumber
-      atm.delta_tau[w * nlay + l] = 0.05 + 0.5 * lfrac + 0.1 * wfrac;
+      atm.delta_tau[w * nlay + l] = static_cast<float>(0.05 + 0.5 * lfrac + 0.1 * wfrac);
       // Single-scattering albedo
-      atm.ssa[w * nlay + l] = 0.7 + 0.2 * (1.0 - lfrac);
+      atm.ssa[w * nlay + l] = static_cast<float>(0.7 + 0.2 * (1.0 - lfrac));
     }
 
     // Temperature profile: 200 K at top, 300 K at bottom
@@ -69,7 +69,7 @@ TestAtmosphere buildAtmosphere(int nlay, int nwav, int nmu, int nmom) {
       double lfrac = static_cast<double>(l) / nlay;
       double T = 200.0 + 100.0 * lfrac;
       // Use Planck-like values (arbitrary units, just need nonzero)
-      atm.planck[w * nlev + l] = T * T * (1.0 + 0.5 * wfrac);
+      atm.planck[w * nlev + l] = static_cast<float>(T * T * (1.0 + 0.5 * wfrac));
     }
   }
 
@@ -98,8 +98,8 @@ double benchmarkCPU(const TestAtmosphere& atm, int nruns) {
       cfg.allocate();
 
       for (int l = 0; l < atm.nlay; ++l) {
-        cfg.delta_tau[l] = atm.delta_tau[w * atm.nlay + l];
-        cfg.single_scat_albedo[l] = atm.ssa[w * atm.nlay + l];
+        cfg.delta_tau[l] = static_cast<double>(atm.delta_tau[w * atm.nlay + l]);
+        cfg.single_scat_albedo[l] = static_cast<double>(atm.ssa[w * atm.nlay + l]);
       }
 
       // Set HG phase function
@@ -109,7 +109,7 @@ double benchmarkCPU(const TestAtmosphere& atm, int nruns) {
       int nlev = atm.nlay + 1;
       cfg.planck_levels.resize(nlev);
       for (int l = 0; l <= atm.nlay; ++l)
-        cfg.planck_levels[l] = atm.planck[w * nlev + l];
+        cfg.planck_levels[l] = static_cast<double>(atm.planck[w * nlev + l]);
 
       cfg.surface_albedo = 0.1;
 
@@ -139,25 +139,25 @@ double benchmarkCUDA(const TestAtmosphere& atm, int nruns) {
   int nlev = nlay + 1;
 
   // Allocate device memory
-  double *d_dtau, *d_ssa, *d_pmom, *d_planck;
-  double *d_flux_up, *d_flux_down, *d_flux_direct;
+  float *d_dtau, *d_ssa, *d_pmom, *d_planck;
+  float *d_flux_up, *d_flux_down, *d_flux_direct;
 
-  cudaMalloc(&d_dtau, nwav * nlay * sizeof(double));
-  cudaMalloc(&d_ssa, nwav * nlay * sizeof(double));
-  cudaMalloc(&d_pmom, nlay * nmom * sizeof(double));
-  cudaMalloc(&d_planck, nwav * nlev * sizeof(double));
-  cudaMalloc(&d_flux_up, nwav * sizeof(double));
-  cudaMalloc(&d_flux_down, nwav * sizeof(double));
-  cudaMalloc(&d_flux_direct, nwav * sizeof(double));
+  cudaMalloc(&d_dtau, nwav * nlay * sizeof(float));
+  cudaMalloc(&d_ssa, nwav * nlay * sizeof(float));
+  cudaMalloc(&d_pmom, nlay * nmom * sizeof(float));
+  cudaMalloc(&d_planck, nwav * nlev * sizeof(float));
+  cudaMalloc(&d_flux_up, nwav * sizeof(float));
+  cudaMalloc(&d_flux_down, nwav * sizeof(float));
+  cudaMalloc(&d_flux_direct, nwav * sizeof(float));
 
   // Upload data
-  cudaMemcpy(d_dtau, atm.delta_tau.data(), nwav * nlay * sizeof(double),
+  cudaMemcpy(d_dtau, atm.delta_tau.data(), nwav * nlay * sizeof(float),
              cudaMemcpyHostToDevice);
-  cudaMemcpy(d_ssa, atm.ssa.data(), nwav * nlay * sizeof(double),
+  cudaMemcpy(d_ssa, atm.ssa.data(), nwav * nlay * sizeof(float),
              cudaMemcpyHostToDevice);
-  cudaMemcpy(d_pmom, atm.pmom.data(), nlay * nmom * sizeof(double),
+  cudaMemcpy(d_pmom, atm.pmom.data(), nlay * nmom * sizeof(float),
              cudaMemcpyHostToDevice);
-  cudaMemcpy(d_planck, atm.planck.data(), nwav * nlev * sizeof(double),
+  cudaMemcpy(d_planck, atm.planck.data(), nwav * nlev * sizeof(float),
              cudaMemcpyHostToDevice);
 
   adrt::cuda::BatchConfig bcfg;
@@ -198,8 +198,8 @@ double benchmarkCUDA(const TestAtmosphere& atm, int nruns) {
   cudaEventElapsedTime(&ms_gpu, start, stop);
 
   // Read back one value to verify
-  double first_flux;
-  cudaMemcpy(&first_flux, d_flux_up, sizeof(double), cudaMemcpyDeviceToHost);
+  float first_flux;
+  cudaMemcpy(&first_flux, d_flux_up, sizeof(float), cudaMemcpyDeviceToHost);
 
   cudaEventDestroy(start);
   cudaEventDestroy(stop);

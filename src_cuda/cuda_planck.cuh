@@ -29,13 +29,14 @@ __device__ __forceinline__ double planck_kernel(double v) {
 
 /// Compute Planck function integrated between two wavenumbers.
 /// Device-side equivalent of adrt::planckFunction().
-__device__ __forceinline__ double planck_function(
+/// Internal computation in double for accuracy; returns float.
+__device__ __forceinline__ float planck_function(
     double wnumlo, double wnumhi, double temp)
 {
   using namespace PlanckConstants;
 
   if (temp < 1.0e-4)
-    return 0.0;
+    return 0.0f;
 
   if (wnumhi == wnumlo) {
     double arg = exp(-C2 * wnumhi / temp);
@@ -117,7 +118,7 @@ __device__ __forceinline__ double planck_function(
 
   ans *= sigdpi * pow(temp, 4.0);
 
-  return (ans == 0.0) ? 0.0 : ans;
+  return static_cast<float>((ans == 0.0) ? 0.0 : ans);
 }
 
 } // namespace cuda

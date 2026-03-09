@@ -71,27 +71,35 @@ static void cudaSolveSingle(
   }
 
   // Flatten data into SoA format (single wavenumber, so trivial)
-  std::vector<double> delta_tau(config.delta_tau);
-  std::vector<double> ssa(config.single_scat_albedo);
+  // Convert double → float for the CUDA solver
+  std::vector<float> delta_tau(nlay);
+  std::vector<float> ssa(nlay);
+  for (int l = 0; l < nlay; ++l) {
+    delta_tau[l] = static_cast<float>(config.delta_tau[l]);
+    ssa[l] = static_cast<float>(config.single_scat_albedo[l]);
+  }
 
   // Flatten phase moments: [nlay * nmom_max], zero-padded
-  std::vector<double> pmom(nlay * nmom_max, 0.0);
+  std::vector<float> pmom(nlay * nmom_max, 0.0f);
   for (int l = 0; l < nlay; ++l) {
     const auto& chi = config.phase_function_moments[l];
     for (int m = 0; m < static_cast<int>(chi.size()); ++m)
-      pmom[l * nmom_max + m] = chi[m];
+      pmom[l * nmom_max + m] = static_cast<float>(chi[m]);
   }
 
   // Planck levels
-  std::vector<double> planck(nlev, 0.0);
+  std::vector<float> planck(nlev, 0.0f);
   if (!config.planck_levels.empty()) {
-    planck = config.planck_levels;
+    for (int l = 0; l < nlev; ++l)
+      planck[l] = static_cast<float>(config.planck_levels[l]);
   }
 
   // Temperature
-  std::vector<double> temperature;
+  std::vector<float> temperature;
   if (config.use_thermal_emission) {
-    temperature = config.temperature;
+    temperature.resize(config.temperature.size());
+    for (size_t i = 0; i < config.temperature.size(); ++i)
+      temperature[i] = static_cast<float>(config.temperature[i]);
   }
 
   adrt::cuda::BatchConfig bcfg;
@@ -113,8 +121,8 @@ static void cudaSolveSingle(
   auto result = adrt::cuda::solveBatchHost(
       bcfg, delta_tau, ssa, pmom, true, planck, temperature);
 
-  flux_up = result.flux_up[0];
-  flux_down = result.flux_down[0];
+  flux_up = static_cast<double>(result.flux_up[0]);
+  flux_down = static_cast<double>(result.flux_down[0]);
 }
 
 
@@ -139,8 +147,8 @@ void test_pure_absorption() {
   cpuSolve(config, cpu_up, cpu_down);
   cudaSolveSingle(config, cuda_up, cuda_down);
 
-  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1e-10);
-  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1e-10);
+  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1e-6);
+  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1e-6);
   std::cout << "done\n";
 }
 
@@ -162,8 +170,8 @@ void test_isotropic_conservative() {
   cpuSolve(config, cpu_up, cpu_down);
   cudaSolveSingle(config, cuda_up, cuda_down);
 
-  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1e-8);
-  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1e-8);
+  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1e-4);
+  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1e-4);
   std::cout << "done\n";
 }
 
@@ -188,8 +196,8 @@ void test_hg_thermal() {
   cpuSolve(config, cpu_up, cpu_down);
   cudaSolveSingle(config, cuda_up, cuda_down);
 
-  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1e-6);
-  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1e-6);
+  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1.0);
+  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1.0);
   std::cout << "done\n";
 }
 
@@ -216,8 +224,8 @@ void test_solar_surface() {
   cpuSolve(config, cpu_up, cpu_down);
   cudaSolveSingle(config, cuda_up, cuda_down);
 
-  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1e-8);
-  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1e-8);
+  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1e-4);
+  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1e-4);
   std::cout << "done\n";
 }
 
@@ -248,8 +256,8 @@ void test_multilayer() {
   cpuSolve(config, cpu_up, cpu_down);
   cudaSolveSingle(config, cuda_up, cuda_down);
 
-  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1e-6);
-  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1e-6);
+  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1e-1);
+  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1e-1);
   std::cout << "done\n";
 }
 
@@ -263,23 +271,23 @@ void test_batch_consistency() {
   int nmom = 3;
 
   // Set up identical inputs for all wavenumbers
-  std::vector<double> delta_tau(nwav * nlay);
-  std::vector<double> ssa(nwav * nlay);
-  std::vector<double> pmom(nlay * nmom, 0.0);  // shared
-  std::vector<double> planck(nwav * (nlay + 1));
+  std::vector<float> delta_tau(nwav * nlay);
+  std::vector<float> ssa(nwav * nlay);
+  std::vector<float> pmom(nlay * nmom, 0.0f);  // shared
+  std::vector<float> planck(nwav * (nlay + 1));
 
   // Isotropic phase function
-  pmom[0 * nmom + 0] = 1.0;  // chi[0] = 1 for all layers
+  pmom[0 * nmom + 0] = 1.0f;  // chi[0] = 1 for all layers
   for (int l = 1; l < nlay; ++l)
-    pmom[l * nmom + 0] = 1.0;
+    pmom[l * nmom + 0] = 1.0f;
 
   for (int w = 0; w < nwav; ++w) {
     for (int l = 0; l < nlay; ++l) {
-      delta_tau[w * nlay + l] = 0.5;
-      ssa[w * nlay + l] = 0.8;
+      delta_tau[w * nlay + l] = 0.5f;
+      ssa[w * nlay + l] = 0.8f;
     }
     for (int l = 0; l <= nlay; ++l)
-      planck[w * (nlay + 1) + l] = 100.0 + 20.0 * l;
+      planck[w * (nlay + 1) + l] = 100.0f + 20.0f * l;
   }
 
   adrt::cuda::BatchConfig bcfg;
@@ -295,8 +303,8 @@ void test_batch_consistency() {
   // All wavenumbers should produce the same result
   bool all_same = true;
   for (int w = 1; w < nwav; ++w) {
-    if (std::abs(result.flux_up[w] - result.flux_up[0]) > 1e-12 ||
-        std::abs(result.flux_down[w] - result.flux_down[0]) > 1e-12) {
+    if (std::abs(result.flux_up[w] - result.flux_up[0]) > 1e-6f ||
+        std::abs(result.flux_down[w] - result.flux_down[0]) > 1e-6f) {
       all_same = false;
       break;
     }
@@ -332,8 +340,8 @@ void test_optically_thick() {
   cpuSolve(config, cpu_up, cpu_down);
   cudaSolveSingle(config, cuda_up, cuda_down);
 
-  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1e-4);
-  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1e-4);
+  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1e-1);
+  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1e-1);
   std::cout << "done\n";
 }
 

@@ -41,26 +41,26 @@ struct BatchConfig {
 struct DeviceData {
   // --- Inputs (caller-owned device memory) ---
 
-  const double* delta_tau;            ///< [nwav * nlay] optical depth per layer
-  const double* single_scat_albedo;   ///< [nwav * nlay] single-scattering albedo
-  const double* phase_moments;        ///< [nwav * nlay * nmom] or [nlay * nmom]
-  bool phase_moments_shared = false;  ///< true if moments are the same for all wavenumbers
+  const float* delta_tau;            ///< [nwav * nlay] optical depth per layer
+  const float* single_scat_albedo;   ///< [nwav * nlay] single-scattering albedo
+  const float* phase_moments;        ///< [nwav * nlay * nmom] or [nlay * nmom]
+  bool phase_moments_shared = false; ///< true if moments are the same for all wavenumbers
 
   /// Planck / thermal source at each level.
   /// If use_thermal_emission: temperature[nwav * nlev] (Planck computed on device).
   /// Otherwise: planck_levels[nwav * nlev] (pre-computed Planck values).
-  const double* temperature = nullptr;     ///< [nwav * nlev] or nullptr
-  const double* planck_levels = nullptr;   ///< [nwav * nlev] or nullptr
+  const float* temperature = nullptr;     ///< [nwav * nlev] or nullptr
+  const float* planck_levels = nullptr;   ///< [nwav * nlev] or nullptr
 
   /// Per-wavenumber surface/top emission (used when not computing from temperature).
-  const double* surface_emission = nullptr;  ///< [nwav] or nullptr (uses BatchConfig value)
-  const double* top_emission = nullptr;      ///< [nwav] or nullptr
+  const float* surface_emission = nullptr;  ///< [nwav] or nullptr (uses BatchConfig value)
+  const float* top_emission = nullptr;      ///< [nwav] or nullptr
 
   // --- Outputs (caller-owned device memory) ---
 
-  double* flux_up = nullptr;       ///< [nwav] TOA upward flux
-  double* flux_down = nullptr;     ///< [nwav] TOA downward flux
-  double* flux_direct = nullptr;   ///< [nwav] direct solar flux at surface, or nullptr
+  float* flux_up = nullptr;       ///< [nwav] TOA upward flux
+  float* flux_down = nullptr;     ///< [nwav] TOA downward flux
+  float* flux_direct = nullptr;   ///< [nwav] direct solar flux at surface, or nullptr
 };
 
 
@@ -79,19 +79,19 @@ void solveBatch(
 /// Convenience: solve from host-side data.
 /// Allocates device memory, copies data, runs kernel, copies results back.
 struct HostResult {
-  std::vector<double> flux_up;       ///< [nwav] TOA upward flux
-  std::vector<double> flux_down;     ///< [nwav] TOA downward flux
-  std::vector<double> flux_direct;   ///< [nwav] direct solar at surface
+  std::vector<float> flux_up;       ///< [nwav] TOA upward flux
+  std::vector<float> flux_down;     ///< [nwav] TOA downward flux
+  std::vector<float> flux_direct;   ///< [nwav] direct solar at surface
 };
 
 HostResult solveBatchHost(
     const BatchConfig& config,
-    const std::vector<double>& delta_tau,           // [nwav * nlay]
-    const std::vector<double>& single_scat_albedo,  // [nwav * nlay]
-    const std::vector<double>& phase_moments,       // [nwav * nlay * nmom] or [nlay * nmom]
+    const std::vector<float>& delta_tau,           // [nwav * nlay]
+    const std::vector<float>& single_scat_albedo,  // [nwav * nlay]
+    const std::vector<float>& phase_moments,       // [nwav * nlay * nmom] or [nlay * nmom]
     bool phase_moments_shared,
-    const std::vector<double>& planck_levels,        // [nwav * nlev] or empty
-    const std::vector<double>& temperature = {});    // [nwav * nlev] or empty
+    const std::vector<float>& planck_levels,        // [nwav * nlev] or empty
+    const std::vector<float>& temperature = {});    // [nwav * nlev] or empty
 
 
 } // namespace cuda

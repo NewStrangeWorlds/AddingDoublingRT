@@ -16,9 +16,9 @@ namespace adrt {
 namespace cuda {
 
 /// Adaptive number of initial doublings based on single-scattering albedo.
-__device__ __forceinline__ int compute_ipow0(double omega) {
-  if (omega < 0.01) return 4;
-  if (omega < 0.1)  return 10;
+__device__ __forceinline__ int compute_ipow0(float omega) {
+  if (omega < 0.01f) return 4;
+  if (omega < 0.1f)  return 10;
   return 16;
 }
 
@@ -40,36 +40,36 @@ __device__ __forceinline__ int compute_ipow0(double omega) {
 template<int N>
 __device__ __forceinline__ void doubling(
     GpuLayerMatrices<N>& layer,
-    double tau, double omega,
-    double B_top, double B_bottom,
+    float tau, float omega,
+    float B_top, float B_bottom,
     const GpuMatrix<N>& Ppp, const GpuMatrix<N>& Ppm,
-    double solar_flux, double solar_mu, double tau_cumulative,
+    float solar_flux, float solar_mu, float tau_cumulative,
     const GpuVec<N>* p_plus_solar, const GpuVec<N>* p_minus_solar,
     bool has_solar_phase)
 {
-  constexpr double PI = 3.14159265358979323846;
+  constexpr float PI = 3.14159265f;
 
   layer.set_transparent();
 
-  double B_bar = (B_bottom + B_top) * 0.5;
-  double B_d = (tau > 0.0) ? (B_bottom - B_top) / tau : 0.0;
+  float B_bar = (B_bottom + B_top) * 0.5f;
+  float B_d = (tau > 0.0f) ? (B_bottom - B_top) / tau : 0.0f;
 
-  if (tau <= 0.0)
+  if (tau <= 0.0f)
     return;
 
   // --- Pure absorption (no scattering) ---
-  if (omega <= 0.0) {
+  if (omega <= 0.0f) {
     mat_set_zero<N>(layer.T_ab);
     mat_set_zero<N>(layer.T_ba);
 
     #pragma unroll
     for (int i = 0; i < N; ++i) {
-      double tex = -tau / d_mu[i];
-      double trans = (tex > -200.0) ? exp(tex) : 0.0;
+      float tex = -tau / d_mu[i];
+      float trans = (tex > -87.0f) ? expf(tex) : 0.0f;
       layer.T_ab(i, i) = trans;
       layer.T_ba(i, i) = trans;
-      double one_minus_t = 1.0 - trans;
-      double slope_term = d_mu[i] * one_minus_t - 0.5 * tau * (1.0 + trans);
+      float one_minus_t = 1.0f - trans;
+      float slope_term = d_mu[i] * one_minus_t - 0.5f * tau * (1.0f + trans);
       layer.s_up[i]   = B_bar * one_minus_t + B_d * slope_term;
       layer.s_down[i] = B_bar * one_minus_t - B_d * slope_term;
     }
@@ -78,45 +78,37 @@ __device__ __forceinline__ void doubling(
 
   // --- General case: scattering layer ---
   layer.is_scattering = true;
-  if (omega > 1.0) omega = 1.0;
+  if (omega > 1.0f) omega = 1.0f;
 
-  double con = 2.0 * omega * PI;
+  float con = 2.0f * omega * PI;
 
   // Build Gpp = (I - 2*omega*pi*Ppp*C) / diag(mu)
   // Build Gpm = 2*omega*pi*Ppm*C / diag(mu)
   GpuMatrix<N> Gpp, Gpm;
 
-  // Ppp * diag(wt) → PppC, then Gpp = (I - con*PppC) / mu[i]
+  // C = diag(wt), so (P*C)(i,j) = P(i,j)*wt[j]
   #pragma unroll
   for (int i = 0; i < N; ++i) {
+    float inv_mu = 1.0f / d_mu[i];
     #pragma unroll
     for (int j = 0; j < N; ++j) {
-      double PppC_ij = 0.0;
-      double PpmC_ij = 0.0;
-      #pragma unroll
-      for (int k = 0; k < N; ++k) {
-        PppC_ij += Ppp(i, k) * d_wt[k] * ((k == j) ? 1.0 : 0.0);
-        PpmC_ij += Ppm(i, k) * d_wt[k] * ((k == j) ? 1.0 : 0.0);
-      }
-      // Simplification: C is diagonal, so PppC(i,j) = Ppp(i,j)*wt[j]
-      // The loop above is inefficient; let's use the simple form directly.
-      double ppc = Ppp(i, j) * d_wt[j];
-      double pmc = Ppm(i, j) * d_wt[j];
-      double delta_ij = (i == j) ? 1.0 : 0.0;
-      Gpp(i, j) = (delta_ij - con * ppc) / d_mu[i];
-      Gpm(i, j) = con * pmc / d_mu[i];
+      float ppc = Ppp(i, j) * d_wt[j];
+      float pmc = Ppm(i, j) * d_wt[j];
+      float delta_ij = (i == j) ? 1.0f : 0.0f;
+      Gpp(i, j) = (delta_ij - con * ppc) * inv_mu;
+      Gpm(i, j) = con * pmc * inv_mu;
     }
   }
 
   // Adaptive doubling count
-  int nn = static_cast<int>(log(tau) / log(2.0)) + compute_ipow0(omega);
+  int nn = static_cast<int>(logf(tau) / logf(2.0f)) + compute_ipow0(omega);
   if (nn < 1) nn = 1;
 
-  double xfac = 1.0 / exp2(static_cast<double>(nn));
-  double tau0 = tau * xfac;
+  float xfac = 1.0f / exp2f(static_cast<float>(nn));
+  float tau0 = tau * xfac;
 
-  bool has_solar = (solar_flux > 0.0 && solar_mu > 0.0 && has_solar_phase);
-  double F_top = has_solar ? solar_flux * exp(-tau_cumulative / solar_mu) : 0.0;
+  bool has_solar = (solar_flux > 0.0f && solar_mu > 0.0f && has_solar_phase);
+  float F_top = has_solar ? solar_flux * expf(-tau_cumulative / solar_mu) : 0.0f;
 
   // Initial R_k, T_k for thin sub-layer
   GpuMatrix<N> R_k, T_k;
@@ -124,7 +116,7 @@ __device__ __forceinline__ void doubling(
   for (int i = 0; i < N; ++i) {
     #pragma unroll
     for (int j = 0; j < N; ++j) {
-      T_k(i, j) = ((i == j) ? 1.0 : 0.0) - tau0 * Gpp(i, j);
+      T_k(i, j) = ((i == j) ? 1.0f : 0.0f) - tau0 * Gpp(i, j);
       R_k(i, j) = tau0 * Gpm(i, j);
     }
   }
@@ -134,7 +126,7 @@ __device__ __forceinline__ void doubling(
   vec_set_zero<N>(z_k);
   #pragma unroll
   for (int i = 0; i < N; ++i)
-    y_k[i] = (1.0 - omega) * tau0 / d_mu[i];
+    y_k[i] = (1.0f - omega) * tau0 / d_mu[i];
 
   GpuVec<N> s_up_sol_k, s_down_sol_k;
   vec_set_zero<N>(s_up_sol_k);
@@ -143,14 +135,14 @@ __device__ __forceinline__ void doubling(
   if (has_solar) {
     #pragma unroll
     for (int i = 0; i < N; ++i) {
-      double base = omega * tau0 / d_mu[i] * F_top;
+      float base = omega * tau0 / d_mu[i] * F_top;
       s_up_sol_k[i]   = base * (*p_minus_solar)[i];
       s_down_sol_k[i] = base * (*p_plus_solar)[i];
     }
   }
 
-  double g_k = 0.5 * tau0;
-  double gamma_sol = has_solar ? exp(-tau0 / solar_mu) : 0.0;
+  float g_k = 0.5f * tau0;
+  float gamma_sol = has_solar ? expf(-tau0 / solar_mu) : 0.0f;
 
   // --- Doubling iteration ---
   for (int k = 0; k < nn; ++k) {
@@ -160,7 +152,7 @@ __device__ __forceinline__ void doubling(
     // I - R_k^2
     GpuMatrix<N> I_mat;
     mat_set_identity<N>(I_mat);
-    mat_add<N>(I_minus_R2, I_mat, R_sq, -1.0);
+    mat_add<N>(I_minus_R2, I_mat, R_sq, -1.0f);
 
     // TG = (I - R^2)^{-1} * T_k  via rightSolve: TG * (I - R^2) = T_k
     // i.e. solve X * A = B where A = I_minus_R2, B = T_k
@@ -173,7 +165,7 @@ __device__ __forceinline__ void doubling(
     // R_new = R_k + TGR * T_k
     GpuMatrix<N> TGR_T, R_new;
     mat_multiply<N>(TGR_T, TGR, T_k);
-    mat_add<N>(R_new, R_k, TGR_T, 1.0);
+    mat_add<N>(R_new, R_k, TGR_T, 1.0f);
 
     // T_new = TG * T_k
     GpuMatrix<N> T_new;
@@ -235,7 +227,7 @@ __device__ __forceinline__ void doubling(
     vec_copy<N>(z_k, z_new);
     vec_copy<N>(s_up_sol_k, s_up_sol_new);
     vec_copy<N>(s_down_sol_k, s_down_sol_new);
-    g_k = 2.0 * g_k;
+    g_k = 2.0f * g_k;
   }
 
   // --- Assemble result ---
