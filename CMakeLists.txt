@@ -97,6 +97,13 @@ if(ADRT_ENABLE_CUDA)
     target_link_libraries(ad_cuda_tests adding_doubling adding_doubling_cuda)
     target_include_directories(ad_cuda_tests PRIVATE tests)
     add_test(NAME ad_cuda_tests COMMAND ad_cuda_tests)
+
+    # CUDA benchmark
+    add_executable(ad_cuda_benchmark
+        tests/benchmark_cuda.cu
+    )
+    target_link_libraries(ad_cuda_benchmark adding_doubling adding_doubling_cuda)
+    target_include_directories(ad_cuda_benchmark PRIVATE tests)
 endif()
 
 # Print configuration
