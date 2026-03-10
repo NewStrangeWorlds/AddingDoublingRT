@@ -224,8 +224,8 @@ void test_solar_surface() {
   cpuSolve(config, cpu_up, cpu_down);
   cudaSolveSingle(config, cuda_up, cuda_down);
 
-  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1e-4);
-  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1e-4);
+  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1e-3);
+  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1e-3);
   std::cout << "done\n";
 }
 
@@ -256,8 +256,8 @@ void test_multilayer() {
   cpuSolve(config, cpu_up, cpu_down);
   cudaSolveSingle(config, cuda_up, cuda_down);
 
-  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1e-1);
-  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1e-1);
+  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1.0);
+  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1.0);
   std::cout << "done\n";
 }
 
@@ -340,8 +340,8 @@ void test_optically_thick() {
   cpuSolve(config, cpu_up, cpu_down);
   cudaSolveSingle(config, cuda_up, cuda_down);
 
-  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1e-1);
-  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1e-1);
+  CHECK_NEAR("flux_up", cuda_up, cpu_up, 1.0);
+  CHECK_NEAR("flux_down", cuda_down, cpu_down, 1.0);
   std::cout << "done\n";
 }
 

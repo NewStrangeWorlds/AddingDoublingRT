@@ -79,38 +79,44 @@ __device__ __forceinline__ void add_layers_general(
 {
   ans.is_scattering = true;
 
-  GpuMatrix<N> I_mat;
-  mat_set_identity<N>(I_mat);
+  // Uses 3 temp N×N matrices (A, T_ba_D1, T_bc_D2) instead of 11.
+  GpuMatrix<N> A;
 
-  // A1 = I - R_bot * R_top_ba
-  GpuMatrix<N> RbotRtop, A1;
-  mat_multiply<N>(RbotRtop, bot.R_ab, top.R_ba);
-  mat_add<N>(A1, I_mat, RbotRtop, -1.0);
+  // A = I - R_bot * R_top_ba
+  mat_multiply<N>(A, bot.R_ab, top.R_ba);
+  #pragma unroll
+  for (int i = 0; i < N * N; ++i)
+    A.data[i] = -A.data[i];
+  #pragma unroll
+  for (int i = 0; i < N; ++i)
+    A(i, i) += 1.0f;
 
-  // A2 = I - R_top_ba * R_bot
-  GpuMatrix<N> RtopRbot, A2;
-  mat_multiply<N>(RtopRbot, top.R_ba, bot.R_ab);
-  mat_add<N>(A2, I_mat, RtopRbot, -1.0);
-
-  // T_ba_D1 = T_top_ba * (I - R_bot * R_top_ba)^{-1}
-  // i.e. solve: T_ba_D1 * A1 = T_top_ba
+  // T_ba_D1 = T_top_ba * A^{-1}  (right solve: T_ba_D1 * A = T_top_ba)
   GpuMatrix<N> T_ba_D1;
-  mat_right_solve_matrix<N>(T_ba_D1, A1, top.T_ba);
+  mat_right_solve_matrix<N>(T_ba_D1, A, top.T_ba);
 
-  // T_bc_D2 = T_bot_ab * (I - R_top_ba * R_bot)^{-1}
+  // A = I - R_top_ba * R_bot
+  mat_multiply<N>(A, top.R_ba, bot.R_ab);
+  #pragma unroll
+  for (int i = 0; i < N * N; ++i)
+    A.data[i] = -A.data[i];
+  #pragma unroll
+  for (int i = 0; i < N; ++i)
+    A(i, i) += 1.0f;
+
+  // T_bc_D2 = T_bot_ab * A^{-1}  (right solve: T_bc_D2 * A = T_bot_ab)
   GpuMatrix<N> T_bc_D2;
-  mat_right_solve_matrix<N>(T_bc_D2, A2, bot.T_ab);
+  mat_right_solve_matrix<N>(T_bc_D2, A, bot.T_ab);
 
-  // Composite reflection
-  GpuMatrix<N> temp1, temp1_T;
-  mat_multiply<N>(temp1, T_ba_D1, bot.R_ab);
-  mat_multiply<N>(temp1_T, temp1, top.T_ab);
-  mat_add<N>(ans.R_ab, top.R_ab, temp1_T, 1.0);
+  // Composite reflection: ans.R_ab = top.R_ab + T_ba_D1 * bot.R_ab * top.T_ab
+  mat_copy<N>(ans.R_ab, top.R_ab);
+  mat_multiply<N>(A, T_ba_D1, bot.R_ab);
+  mat_multiply_addto<N>(ans.R_ab, A, top.T_ab);
 
-  GpuMatrix<N> temp2, temp2_T;
-  mat_multiply<N>(temp2, T_bc_D2, top.R_ba);
-  mat_multiply<N>(temp2_T, temp2, bot.T_ba);
-  mat_add<N>(ans.R_ba, bot.R_ba, temp2_T, 1.0);
+  // ans.R_ba = bot.R_ba + T_bc_D2 * top.R_ba * bot.T_ba
+  mat_copy<N>(ans.R_ba, bot.R_ba);
+  mat_multiply<N>(A, T_bc_D2, top.R_ba);
+  mat_multiply_addto<N>(ans.R_ba, A, bot.T_ba);
 
   // Composite transmission
   mat_multiply<N>(ans.T_ab, T_bc_D2, top.T_ab);

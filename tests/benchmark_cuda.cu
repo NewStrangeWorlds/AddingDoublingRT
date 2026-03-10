@@ -241,6 +241,7 @@ int main() {
     {  50,  1000, 8, 16,  1,  100, "Medium (50 layers, 1000 wn, N=8)"},
     { 100, 20000, 8, 16,  1,   50, "Large  (100 layers, 20000 wn, N=8)"},
     { 100, 20000, 4, 8,   1,   50, "Large  (100 layers, 20000 wn, N=4)"},
+    { 100, 20000, 16, 32, 1,   20, "Large  (100 layers, 20000 wn, N=16)"},
   };
 
   std::cout << std::left << std::setw(46) << "Configuration"

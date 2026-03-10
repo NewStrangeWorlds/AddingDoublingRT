@@ -9,6 +9,10 @@
 #include "cuda_phase_matrix.cuh"
 #include "cuda_planck.cuh"
 #include "cuda_quadrature.cuh"
+#include "cuda_warp_adding.cuh"
+#include "cuda_warp_doubling.cuh"
+#include "cuda_warp_layer.cuh"
+#include "cuda_warp_matrix.cuh"
 
 #include <cmath>
 #include <cstdio>
@@ -246,6 +250,11 @@ __global__ void solveKernel(
     B_prev = B_layer_top;
 
     tau_above -= tau_layer;
+
+    // Skip effectively transparent layers (avoid expensive doubling + adding)
+    if (tau_layer < 1e-8f)
+      continue;
+
     float tau_cumulative = tau_above;
 
     // Build phase matrices (precomputed or on-the-fly)
@@ -404,6 +413,350 @@ __global__ void solveKernel(
 
 
 // ============================================================================
+//  Warp-cooperative solver kernel: N threads per wavenumber
+//  Used for N=8 and N=16 to eliminate register spilling.
+// ============================================================================
+
+template<int N>
+__global__ void solveKernelWarp(
+    DeviceBatchConfig cfg,
+    const float* __restrict__ delta_tau,
+    const float* __restrict__ single_scat_albedo,
+    const float* __restrict__ phase_moments,
+    const float* __restrict__ temperature,
+    const float* __restrict__ planck_levels,
+    const float* __restrict__ per_wav_surface_emission,
+    const float* __restrict__ per_wav_top_emission,
+    float* __restrict__ flux_up_out,
+    float* __restrict__ flux_down_out,
+    float* __restrict__ flux_direct_out,
+    const float* __restrict__ precomp_Ppp,
+    const float* __restrict__ precomp_Ppm,
+    const float* __restrict__ precomp_f_trunc,
+    const float* __restrict__ precomp_solar_pp,
+    const float* __restrict__ precomp_solar_pm)
+{
+  constexpr float PI = 3.14159265f;
+  constexpr int GROUPS_PER_BLOCK = 128 / N;
+
+  int row_id = threadIdx.x % N;
+  int group_in_block = threadIdx.x / N;
+  int w = blockIdx.x * GROUPS_PER_BLOCK + group_in_block;
+  if (w >= cfg.nwav) return;
+
+  int nlay = cfg.nlay;
+  int nlev = nlay + 1;
+  int two_M = 2 * N;
+  bool has_solar = (cfg.solar_flux > 0.0f && cfg.solar_mu > 0.0f);
+
+  // --- 1. Planck / thermal source setup ---
+  // All N threads in a group redundantly compute the same scalar values.
+  auto loadB = [&](int level) -> float {
+    if (cfg.use_thermal_emission && temperature != nullptr)
+      return planck_function(
+          static_cast<double>(cfg.wavenumber_low),
+          static_cast<double>(cfg.wavenumber_high),
+          static_cast<double>(temperature[w * nlev + level]));
+    else if (planck_levels != nullptr)
+      return planck_levels[w * nlev + level];
+    else
+      return 0.0f;
+  };
+
+  float B_surface = 0.0f;
+  float B_top_emission = 0.0f;
+
+  if (cfg.use_thermal_emission && temperature != nullptr) {
+    B_surface = loadB(nlay);
+  }
+  else {
+    B_surface = (per_wav_surface_emission != nullptr)
+                  ? per_wav_surface_emission[w] : cfg.surface_emission;
+    B_top_emission = (per_wav_top_emission != nullptr)
+                       ? per_wav_top_emission[w] : cfg.top_emission;
+  }
+
+  // --- 2. Process layers: doubling + bottom-up adding (fused) ---
+  WarpLayerMatrices<N> rbase;
+  rbase.set_transparent(row_id);
+  bool rbase_empty = true;
+
+  bool has_precomp = (precomp_Ppp != nullptr);
+
+  // Temporary for Legendre moments (only needed when not precomputed)
+  float chi_buf[MAX_NMOM];
+
+  // Compute total optical depth
+  float tau_total = 0.0f;
+  for (int l = 0; l < nlay; ++l)
+    tau_total += delta_tau[w * nlay + l];
+
+  // Surface layer
+  bool has_surface = !cfg.use_diffusion_lower_bc
+                     && (cfg.surface_albedo > 0.0f || B_surface > 0.0f);
+
+  if (has_surface) {
+    WarpLayerMatrices<N> surf;
+    wmat_set_zero<N>(surf.R_ab);
+    wmat_set_zero<N>(surf.R_ba);
+    wmat_set_zero<N>(surf.T_ab);
+    wmat_set_zero<N>(surf.T_ba);
+    surf.s_up = 0.0f;
+    surf.s_down = 0.0f;
+    surf.s_up_solar = 0.0f;
+    surf.s_down_solar = 0.0f;
+
+    float A = cfg.surface_albedo;
+
+    // Surface reflection: R(i,j) = 2 * A * mu[j] * wt[j] * xfac
+    // Each thread computes its own row
+    #pragma unroll
+    for (int j = 0; j < N; ++j) {
+      float r = 2.0f * A * d_mu[j] * d_wt[j] * d_xfac;
+      surf.R_ab[j] = r;
+      surf.R_ba[j] = r;
+    }
+
+    surf.s_up   = (1.0f - A) * B_surface;
+    surf.s_down = 0.0f;
+
+    if (has_solar && A > 0.0f) {
+      surf.s_up_solar = (A / PI) * cfg.solar_flux * cfg.solar_mu
+                         * expf(-tau_total / cfg.solar_mu);
+    }
+
+    surf.is_scattering = (A > 0.0f);
+    rbase = surf;
+    rbase_empty = false;
+  }
+
+  // Process layers from bottom to top
+  float tau_above = tau_total;
+  float B_prev = loadB(nlay);
+
+  for (int l = nlay - 1; l >= 0; --l) {
+    float tau_layer = delta_tau[w * nlay + l];
+    float omega_layer = single_scat_albedo[w * nlay + l];
+    float B_layer_top = loadB(l);
+    float B_layer_bot = B_prev;
+    B_prev = B_layer_top;
+
+    tau_above -= tau_layer;
+    float tau_cumulative = tau_above;
+
+    // Build phase matrices (distributed: each thread loads only its row)
+    WarpRow<N> Ppp_row, Ppm_row;
+    float p_plus_solar = 0.0f, p_minus_solar = 0.0f;
+    bool has_solar_phase = false;
+
+    if (has_precomp) {
+      float f_trunc = precomp_f_trunc[l];
+      if (cfg.use_delta_m && f_trunc > 0.0f && omega_layer > 0.0f && tau_layer > 0.0f) {
+        float omega_f = omega_layer * f_trunc;
+        tau_layer   = (1.0f - omega_f) * delta_tau[w * nlay + l];
+        omega_layer = omega_layer * (1.0f - f_trunc) / (1.0f - omega_f);
+      }
+
+      if (omega_layer > 0.0f && tau_layer > 0.0f) {
+        // Load only this thread's row from the precomputed phase matrices
+        int base = l * N * N + row_id * N;
+        #pragma unroll
+        for (int j = 0; j < N; ++j) {
+          Ppp_row[j] = precomp_Ppp[base + j];
+          Ppm_row[j] = precomp_Ppm[base + j];
+        }
+
+        if (has_solar && precomp_solar_pp != nullptr) {
+          int vbase = l * N;
+          p_plus_solar  = precomp_solar_pp[vbase + row_id];
+          p_minus_solar = precomp_solar_pm[vbase + row_id];
+          has_solar_phase = true;
+        }
+      }
+      else {
+        wmat_set_zero<N>(Ppp_row);
+        wmat_set_zero<N>(Ppm_row);
+      }
+    }
+    else {
+      // On-the-fly phase matrix computation (all threads load the same chi)
+      int nmom = cfg.nmom_max;
+      for (int m = 0; m < nmom; ++m)
+        chi_buf[m] = phase_moments[w * nlay * nmom + l * nmom + m];
+
+      if (cfg.use_delta_m && omega_layer > 0.0f && tau_layer > 0.0f) {
+        float f_trunc = (nmom > two_M) ? chi_buf[two_M] : 0.0f;
+
+        if (f_trunc > 1e-12f && f_trunc < 1.0f - 1e-12f) {
+          float omega_f = omega_layer * f_trunc;
+          tau_layer   = (1.0f - omega_f) * delta_tau[w * nlay + l];
+          omega_layer = omega_layer * (1.0f - f_trunc) / (1.0f - omega_f);
+
+          for (int m = 0; m < two_M; ++m)
+            chi_buf[m] = (chi_buf[m] - f_trunc) / (1.0f - f_trunc);
+          nmom = two_M;
+        }
+        else {
+          if (nmom > two_M) nmom = two_M;
+        }
+      }
+
+      if (omega_layer > 0.0f && tau_layer > 0.0f) {
+        // Compute only this thread's row of the phase matrices
+        constexpr float inv_2pi = 1.0f / (2.0f * 3.14159265f);
+
+        #pragma unroll
+        for (int j = 0; j < N; ++j) {
+          float sum_pp = 0.0f, sum_pm = 0.0f;
+          float sign = 1.0f;
+
+          for (int ll = 0; ll < nmom; ++ll) {
+            float Pl_i = d_Pl[ll * MAX_NMU + row_id];
+            float Pl_j = d_Pl[ll * MAX_NMU + j];
+            float term = (2 * ll + 1) * chi_buf[ll] * Pl_i * Pl_j;
+            sum_pp += term;
+            sum_pm += sign * term;
+            sign = -sign;
+          }
+
+          Ppp_row[j] = sum_pp * inv_2pi;
+          Ppm_row[j] = sum_pm * inv_2pi;
+        }
+
+        // Hansen normalisation per column: need sum over all rows
+        // Each thread has one row — need warp reduction per column
+        for (int j = 0; j < N; ++j) {
+          float my_contrib = (Ppp_row[j] + Ppm_row[j]) * d_wt[row_id];
+          float col_sum = my_contrib;
+          unsigned gmask_ph = warp_group_mask<N>();
+          for (int offset = N / 2; offset > 0; offset >>= 1)
+            col_sum += __shfl_down_sync(gmask_ph, col_sum, offset, N);
+          // Broadcast result from lane 0 to all
+          col_sum = __shfl_sync(gmask_ph, col_sum, 0, N);
+
+          if (col_sum > 0.0f) {
+            float correction = inv_2pi / col_sum;
+            Ppp_row[j] *= correction;
+            Ppm_row[j] *= correction;
+          }
+        }
+
+        // Solar phase vectors (each thread computes its own element)
+        if (has_solar) {
+          float Pl_mu0[MAX_NMOM];
+          Pl_mu0[0] = 1.0f;
+          if (nmom > 1) Pl_mu0[1] = cfg.solar_mu;
+          for (int ll = 2; ll < nmom; ++ll)
+            Pl_mu0[ll] = ((2 * ll - 1) * cfg.solar_mu * Pl_mu0[ll - 1]
+                           - (ll - 1) * Pl_mu0[ll - 2]) / ll;
+
+          float sum_p = 0.0f, sum_m = 0.0f;
+          float sign = 1.0f;
+          for (int ll = 0; ll < nmom; ++ll) {
+            float Pl_i = d_Pl[ll * MAX_NMU + row_id];
+            float term = (2 * ll + 1) * chi_buf[ll] * Pl_i * Pl_mu0[ll];
+            sum_p += term;
+            sum_m += sign * term;
+            sign = -sign;
+          }
+          p_plus_solar  = sum_p * inv_2pi;
+          p_minus_solar = sum_m * inv_2pi;
+
+          // Hansen normalisation for solar vectors
+          float my_sv_contrib = (p_plus_solar + p_minus_solar) * d_wt[row_id];
+          float sv_sum = my_sv_contrib;
+          unsigned gmask_sv = warp_group_mask<N>();
+          for (int offset = N / 2; offset > 0; offset >>= 1)
+            sv_sum += __shfl_down_sync(gmask_sv, sv_sum, offset, N);
+          sv_sum = __shfl_sync(gmask_sv, sv_sum, 0, N);
+
+          if (sv_sum > 0.0f) {
+            float correction = inv_2pi / sv_sum;
+            p_plus_solar  *= correction;
+            p_minus_solar *= correction;
+          }
+
+          has_solar_phase = true;
+        }
+      }
+      else {
+        wmat_set_zero<N>(Ppp_row);
+        wmat_set_zero<N>(Ppm_row);
+      }
+    }
+
+    // Doubling
+    WarpLayerMatrices<N> layer;
+    warp_doubling<N>(layer, tau_layer, omega_layer,
+                     B_layer_top, B_layer_bot,
+                     Ppp_row, Ppm_row,
+                     cfg.solar_flux, cfg.solar_mu, tau_cumulative,
+                     has_solar_phase ? p_plus_solar : 0.0f,
+                     has_solar_phase ? p_minus_solar : 0.0f,
+                     has_solar_phase, row_id);
+
+    // Fold into bottom-up composite via adding
+    if (rbase_empty) {
+      rbase = layer;
+      rbase_empty = false;
+    }
+    else {
+      WarpLayerMatrices<N> combined;
+      warp_add_layers<N>(combined, layer, rbase, row_id);
+      rbase = combined;
+    }
+  }
+
+  // B_prev now holds B[0]
+  if (cfg.use_thermal_emission && temperature != nullptr)
+    B_top_emission = B_prev;
+
+  // --- 3. Boundary intensities (distributed: each thread holds its element) ---
+  float I_top_down = B_top_emission;
+  float I_bot_up = 0.0f;
+
+  if (cfg.use_diffusion_lower_bc) {
+    float B_bottom = loadB(nlay);
+    float B_second_last = loadB(nlay - 1);
+    float dtau_last = delta_tau[w * nlay + (nlay - 1)];
+    float dB_dtau = (dtau_last > 0.0f) ? (B_bottom - B_second_last) / dtau_last : 0.0f;
+    I_bot_up = B_bottom + d_mu[row_id] * dB_dtau;
+  }
+  else if (!has_surface) {
+    I_bot_up = B_surface;
+  }
+
+  // --- 4. Compute TOA upward flux ---
+  float Iup_term1 = wmat_vec_multiply<N>(rbase.R_ab, I_top_down);
+  float Iup_term2 = wmat_vec_multiply<N>(rbase.T_ba, I_bot_up);
+
+  float Iup_i = Iup_term1 + Iup_term2 + rbase.s_up + rbase.s_up_solar;
+  float F_up_contrib   = 2.0f * PI * d_wt[row_id] * d_mu[row_id] * Iup_i;
+  float F_down_contrib = 2.0f * PI * d_wt[row_id] * d_mu[row_id] * I_top_down;
+
+  // Reduce across the group
+  float F_up   = wvec_reduce_sum<N>(F_up_contrib);
+  float F_down = wvec_reduce_sum<N>(F_down_contrib);
+
+  // Only lane 0 of each group writes the output
+  if (row_id == 0) {
+    if (flux_up_out != nullptr)
+      flux_up_out[w] = F_up;
+    if (flux_down_out != nullptr)
+      flux_down_out[w] = F_down;
+
+    if (flux_direct_out != nullptr) {
+      if (has_solar)
+        flux_direct_out[w] = cfg.solar_flux * cfg.solar_mu
+                             * expf(-tau_total / cfg.solar_mu);
+      else
+        flux_direct_out[w] = 0.0f;
+    }
+  }
+}
+
+
+// ============================================================================
 //  Host-side kernel launch
 // ============================================================================
 
@@ -499,28 +852,43 @@ void solveBatch(
   }
 
   int threads_per_block = 128;
-  int num_blocks = (config.num_wavenumbers + threads_per_block - 1) / threads_per_block;
 
-  // Dispatch to template specialisation
+  // Dispatch to template specialisation.
+  // N=8 and N=16 use the warp-cooperative kernel (N threads per wavenumber).
+  // N=2, 4, 32 use the original single-thread-per-wavenumber kernel.
+
   #define LAUNCH_SOLVE_KERNEL(NQ) \
-    solveKernel<NQ><<<num_blocks, threads_per_block, 0, stream>>>( \
+    { int num_blocks = (config.num_wavenumbers + threads_per_block - 1) / threads_per_block; \
+      solveKernel<NQ><<<num_blocks, threads_per_block, 0, stream>>>( \
         dcfg, data.delta_tau, data.single_scat_albedo, data.phase_moments, \
         data.temperature, data.planck_levels, \
         data.surface_emission, data.top_emission, \
         data.flux_up, data.flux_down, data.flux_direct, \
         d_precomp_Ppp, d_precomp_Ppm, d_precomp_f_trunc, \
-        d_precomp_solar_pp, d_precomp_solar_pm)
+        d_precomp_solar_pp, d_precomp_solar_pm); }
+
+  #define LAUNCH_WARP_SOLVE_KERNEL(NQ) \
+    { int groups_per_block = threads_per_block / NQ; \
+      int num_blocks = (config.num_wavenumbers + groups_per_block - 1) / groups_per_block; \
+      solveKernelWarp<NQ><<<num_blocks, threads_per_block, 0, stream>>>( \
+        dcfg, data.delta_tau, data.single_scat_albedo, data.phase_moments, \
+        data.temperature, data.planck_levels, \
+        data.surface_emission, data.top_emission, \
+        data.flux_up, data.flux_down, data.flux_direct, \
+        d_precomp_Ppp, d_precomp_Ppm, d_precomp_f_trunc, \
+        d_precomp_solar_pp, d_precomp_solar_pm); }
 
   switch (config.num_quadrature) {
     case 2:  LAUNCH_SOLVE_KERNEL(2);  break;
     case 4:  LAUNCH_SOLVE_KERNEL(4);  break;
     case 8:  LAUNCH_SOLVE_KERNEL(8);  break;
-    case 16: LAUNCH_SOLVE_KERNEL(16); break;
+    case 16: LAUNCH_SOLVE_KERNEL(16); break;  // warp kernel available but single-thread is faster
     case 32: LAUNCH_SOLVE_KERNEL(32); break;
     default: break;
   }
 
   #undef LAUNCH_SOLVE_KERNEL
+  #undef LAUNCH_WARP_SOLVE_KERNEL
 
   // Free precomputed arrays
   if (stream != 0)

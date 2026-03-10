@@ -176,6 +176,44 @@ __device__ __forceinline__ void mat_add_inplace(
     A.data[i] += alpha * B.data[i];
 }
 
+/// C += A * B  (C must not alias A or B; uses N-element row buffer instead of N² temp)
+template<int N>
+__device__ __forceinline__ void mat_multiply_addto(
+    GpuMatrix<N>& C, const GpuMatrix<N>& A, const GpuMatrix<N>& B) {
+  #pragma unroll
+  for (int i = 0; i < N; ++i) {
+    #pragma unroll
+    for (int j = 0; j < N; ++j) {
+      float sum = 0.0f;
+      #pragma unroll
+      for (int k = 0; k < N; ++k)
+        sum += A(i, k) * B(k, j);
+      C(i, j) += sum;
+    }
+  }
+}
+
+/// C = A * B  where C may alias A (NOT B). Computes row-by-row with an N-element buffer.
+template<int N>
+__device__ __forceinline__ void mat_multiply_into(
+    GpuMatrix<N>& C, const GpuMatrix<N>& A, const GpuMatrix<N>& B) {
+  #pragma unroll
+  for (int i = 0; i < N; ++i) {
+    float row[N];
+    #pragma unroll
+    for (int j = 0; j < N; ++j) {
+      float sum = 0.0f;
+      #pragma unroll
+      for (int k = 0; k < N; ++k)
+        sum += A(i, k) * B(k, j);
+      row[j] = sum;
+    }
+    #pragma unroll
+    for (int j = 0; j < N; ++j)
+      C(i, j) = row[j];
+  }
+}
+
 /// C = alpha * A
 template<int N>
 __device__ __forceinline__ void mat_scale(
