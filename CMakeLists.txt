@@ -69,6 +69,7 @@ if(ADRT_ENABLE_CUDA)
     endif()
 
     enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
@@ -78,8 +79,9 @@ if(ADRT_ENABLE_CUDA)
 
     add_library(adding_doubling_cuda
         src_cuda/cuda_solver.cu
+        src_cuda/cuda_batched_solver.cu
     )
-    target_link_libraries(adding_doubling_cuda PUBLIC adding_doubling)
+    target_link_libraries(adding_doubling_cuda PUBLIC adding_doubling CUDA::cublas)
     target_include_directories(adding_doubling_cuda PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/src_cuda)
 

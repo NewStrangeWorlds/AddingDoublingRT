@@ -2,3 +2,6 @@
 build/*
 CMakeFiles/*
 .vscode/
+.pytest_cache/*
+src_jax/__pycache__/*
+tests/__pycache__/*

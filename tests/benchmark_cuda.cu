@@ -8,6 +8,7 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <string>
 #include <vector>
 
 using Clock = std::chrono::high_resolution_clock;
@@ -26,9 +27,15 @@ struct TestAtmosphere {
   std::vector<float> ssa;          // [nwav * nlay]
   std::vector<float> pmom;         // [nlay * nmom] (shared)
   std::vector<float> planck;       // [nwav * nlev]
+
+  double solar_flux = 0.0;
+  double solar_mu = 1.0;
 };
 
-TestAtmosphere buildAtmosphere(int nlay, int nwav, int nmu, int nmom) {
+/// @param source  "thermal" = Planck only, "solar" = beam only,
+///                "mixed" = thermal + solar beam.
+TestAtmosphere buildAtmosphere(int nlay, int nwav, int nmu, int nmom,
+                               const std::string& source = "thermal") {
   TestAtmosphere atm;
   atm.nlay = nlay;
   atm.nwav = nwav;
@@ -40,7 +47,7 @@ TestAtmosphere buildAtmosphere(int nlay, int nwav, int nmu, int nmom) {
   atm.delta_tau.resize(nwav * nlay);
   atm.ssa.resize(nwav * nlay);
   atm.pmom.resize(nlay * nmom, 0.0f);
-  atm.planck.resize(nwav * nlev);
+  atm.planck.resize(nwav * nlev, 0.0f);
 
   // Henyey-Greenstein g=0.7 moments: chi[l] = g^l
   double g = 0.7;
@@ -64,13 +71,20 @@ TestAtmosphere buildAtmosphere(int nlay, int nwav, int nmu, int nmom) {
       atm.ssa[w * nlay + l] = static_cast<float>(0.7 + 0.2 * (1.0 - lfrac));
     }
 
-    // Temperature profile: 200 K at top, 300 K at bottom
-    for (int l = 0; l <= nlay; ++l) {
-      double lfrac = static_cast<double>(l) / nlay;
-      double T = 200.0 + 100.0 * lfrac;
-      // Use Planck-like values (arbitrary units, just need nonzero)
-      atm.planck[w * nlev + l] = static_cast<float>(T * T * (1.0 + 0.5 * wfrac));
+    // Temperature profile (thermal and mixed sources)
+    if (source == "thermal" || source == "mixed") {
+      for (int l = 0; l <= nlay; ++l) {
+        double lfrac = static_cast<double>(l) / nlay;
+        double T = 200.0 + 100.0 * lfrac;
+        atm.planck[w * nlev + l] = static_cast<float>(T * T * (1.0 + 0.5 * wfrac));
+      }
     }
+  }
+
+  // Solar beam parameters (solar and mixed sources)
+  if (source == "solar" || source == "mixed") {
+    atm.solar_flux = 1.0;
+    atm.solar_mu = 0.5;
   }
 
   return atm;
@@ -112,6 +126,11 @@ double benchmarkCPU(const TestAtmosphere& atm, int nruns) {
         cfg.planck_levels[l] = static_cast<double>(atm.planck[w * nlev + l]);
 
       cfg.surface_albedo = 0.1;
+
+      if (atm.solar_flux > 0.0) {
+        cfg.solar_flux = atm.solar_flux;
+        cfg.solar_mu = atm.solar_mu;
+      }
 
       auto result = adrt::solve(cfg, ws);
       total_flux += result.flux_up[0];
@@ -166,6 +185,11 @@ double benchmarkCUDA(const TestAtmosphere& atm, int nruns) {
   bcfg.num_quadrature = atm.nmu;
   bcfg.num_moments_max = nmom;
   bcfg.surface_albedo = 0.1;
+
+  if (atm.solar_flux > 0.0) {
+    bcfg.solar_flux = static_cast<float>(atm.solar_flux);
+    bcfg.solar_mu = static_cast<float>(atm.solar_mu);
+  }
 
   adrt::cuda::DeviceData data;
   data.delta_tau = d_dtau;
@@ -234,14 +258,18 @@ int main() {
     int nlay, nwav, nmu, nmom;
     int cpu_runs, cuda_runs;
     const char* label;
+    const char* source;
   };
 
   Config configs[] = {
-    {  10,   100, 8, 16,  5,  100, "Small  (10 layers, 100 wn, N=8)"},
-    {  50,  1000, 8, 16,  1,  100, "Medium (50 layers, 1000 wn, N=8)"},
-    { 100, 20000, 8, 16,  1,   50, "Large  (100 layers, 20000 wn, N=8)"},
-    { 100, 20000, 4, 8,   1,   50, "Large  (100 layers, 20000 wn, N=4)"},
-    { 100, 20000, 16, 32, 1,   20, "Large  (100 layers, 20000 wn, N=16)"},
+    {  10,   100, 8, 16,  5,  100, "Small  (10 layers, 100 wn, N=8)",           "thermal"},
+    {  50,  1000, 8, 16,  1,  100, "Medium (50 layers, 1000 wn, N=8)",          "thermal"},
+    { 100, 20000, 8, 16,  1,   50, "Large  (100 layers, 20000 wn, N=8)",        "thermal"},
+    { 100, 20000, 4, 8,   1,   50, "Large  (100 layers, 20000 wn, N=4)",        "thermal"},
+    { 100, 20000, 16, 32, 1,   20, "Large  (100 layers, 20000 wn, N=16)",       "thermal"},
+    { 100, 20000, 8, 16,  1,   50, "Large  thermal  (100 lay, 20k wn, N=8)",    "thermal"},
+    { 100, 20000, 8, 16,  1,   50, "Large  solar    (100 lay, 20k wn, N=8)",    "solar"},
+    { 100, 20000, 8, 16,  1,   50, "Large  mixed    (100 lay, 20k wn, N=8)",    "mixed"},
   };
 
   std::cout << std::left << std::setw(46) << "Configuration"
@@ -252,7 +280,7 @@ int main() {
   std::cout << std::string(82, '-') << "\n";
 
   for (auto& c : configs) {
-    auto atm = buildAtmosphere(c.nlay, c.nwav, c.nmu, c.nmom);
+    auto atm = buildAtmosphere(c.nlay, c.nwav, c.nmu, c.nmom, c.source);
 
     double cuda_ms = benchmarkCUDA(atm, c.cuda_runs);
 
@@ -265,7 +293,7 @@ int main() {
     }
     else {
       // For large configs, benchmark CPU with fewer wavenumbers and extrapolate
-      auto small_atm = buildAtmosphere(c.nlay, 100, c.nmu, c.nmom);
+      auto small_atm = buildAtmosphere(c.nlay, 100, c.nmu, c.nmom, c.source);
       double cpu_small_ms = benchmarkCPU(small_atm, 1);
       cpu_ms = cpu_small_ms * (static_cast<double>(c.nwav) / 100.0);
       ran_cpu = false;

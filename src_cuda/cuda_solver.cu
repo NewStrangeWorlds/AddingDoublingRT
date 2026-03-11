@@ -2,6 +2,7 @@
 /// @brief CUDA kernel and host wrappers for the batched adding-doubling solver.
 
 #include "cuda_solver.cuh"
+#include "cuda_batched_solver.cuh"
 #include "cuda_adding.cuh"
 #include "cuda_doubling.cuh"
 #include "cuda_layer.cuh"
@@ -788,14 +789,20 @@ void solveBatch(
   dcfg.wavenumber_low = static_cast<float>(config.wavenumber_low);
   dcfg.wavenumber_high = static_cast<float>(config.wavenumber_high);
 
+  int nlay = config.num_layers;
+  int N = config.num_quadrature;
+  bool has_solar = (config.solar_flux > 0.0 && config.solar_mu > 0.0);
+
+  // N > 8: use batched cuBLAS solver (runtime N, no register spilling)
+  if (N > 8) {
+    solveBatchedCublas(config, data, stream);
+    return;
+  }
+
   // --- Precompute phase matrices for shared moments ---
   float *d_precomp_Ppp = nullptr, *d_precomp_Ppm = nullptr;
   float *d_precomp_f_trunc = nullptr;
   float *d_precomp_solar_pp = nullptr, *d_precomp_solar_pm = nullptr;
-
-  int nlay = config.num_layers;
-  int N = config.num_quadrature;
-  bool has_solar = (config.solar_flux > 0.0 && config.solar_mu > 0.0);
 
   if (data.phase_moments_shared) {
     cudaMalloc(&d_precomp_Ppp, nlay * N * N * sizeof(float));
@@ -853,9 +860,7 @@ void solveBatch(
 
   int threads_per_block = 128;
 
-  // Dispatch to template specialisation.
-  // N=8 and N=16 use the warp-cooperative kernel (N threads per wavenumber).
-  // N=2, 4, 32 use the original single-thread-per-wavenumber kernel.
+  // Dispatch to template specialisation (N <= 8 only; N > 8 handled above).
 
   #define LAUNCH_SOLVE_KERNEL(NQ) \
     { int num_blocks = (config.num_wavenumbers + threads_per_block - 1) / threads_per_block; \
@@ -882,8 +887,6 @@ void solveBatch(
     case 2:  LAUNCH_SOLVE_KERNEL(2);  break;
     case 4:  LAUNCH_SOLVE_KERNEL(4);  break;
     case 8:  LAUNCH_SOLVE_KERNEL(8);  break;
-    case 16: LAUNCH_SOLVE_KERNEL(16); break;  // warp kernel available but single-thread is faster
-    case 32: LAUNCH_SOLVE_KERNEL(32); break;
     default: break;
   }
 
