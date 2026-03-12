@@ -1493,6 +1493,297 @@ void test_n16_specific() {
 
 
 // ============================================================================
+//  Test: Raw-input entry point (solveBatchFromCoefficients)
+// ============================================================================
+
+/// Host-side single-wavenumber Planck matching cuda_planck_single.cuh
+static float planck_single_host(float temperature, float wavenumber) {
+  constexpr float c1 = 1.19105e-08f;
+  constexpr float c2 = 1.43879f;
+  if (temperature < 1e-5f) return 0.0f;
+  float wn3 = wavenumber * wavenumber * wavenumber;
+  return (c1 * wn3) / (std::exp(c2 * wavenumber / temperature) - 1.0f);
+}
+
+static void test_raw_input_entry_point() {
+  std::cout << "=== Raw-input entry point ===\n";
+
+  // Test parameters
+  constexpr int nwav = 4;
+  constexpr int nlay = 5;
+  constexpr int nlev = nlay + 1;
+  constexpr int N = 4;
+  constexpr int nmom = 8;
+
+  // Wavenumbers (cm⁻¹) — typical infrared range
+  double wavenumbers[nwav] = {500.0, 1000.0, 1500.0, 2000.0};
+
+  // Altitude grid (cm, BOA=0) — 6 levels, non-uniform spacing
+  float altitude[nlev] = {0.0f, 1e5f, 3e5f, 6e5f, 1e6f, 2e6f};
+
+  // Temperature profile (K, BOA=0)
+  float temperature[nlev] = {1500.0f, 1300.0f, 1100.0f, 900.0f, 700.0f, 500.0f};
+
+  // Absorption and scattering coefficients [level * nwav + wav], BOA=0
+  std::vector<float> abs_coeff(nlev * nwav);
+  std::vector<float> scat_coeff(nlev * nwav);
+
+  for (int lev = 0; lev < nlev; ++lev) {
+    for (int w = 0; w < nwav; ++w) {
+      // Absorption varies with level and wavenumber
+      abs_coeff[lev * nwav + w] = 1e-6f * (1.0f + 0.5f * lev) * (1.0f + 0.3f * w);
+      // Scattering is a fraction of absorption
+      scat_coeff[lev * nwav + w] = 0.3f * abs_coeff[lev * nwav + w];
+    }
+  }
+
+  // Phase moments: isotropic (shared across wavenumbers)
+  // chi[0] = 1, chi[1..] = 0
+  std::vector<float> pmom(nlay * nmom, 0.0f);
+  for (int l = 0; l < nlay; ++l)
+    pmom[l * nmom + 0] = 1.0f;
+
+  // --- Reference: manually compute delta_tau, ssa, planck on host ---
+  // Then run solveBatchHost with these values.
+
+  std::vector<float> ref_delta_tau(nwav * nlay);
+  std::vector<float> ref_ssa(nwav * nlay);
+  std::vector<float> ref_planck(nwav * nlev);
+
+  for (int w = 0; w < nwav; ++w) {
+    for (int l = 0; l < nlay; ++l) {
+      // ADRT layer l (TOA=0) → BeAR layer = nlay - 1 - l (BOA=0)
+      int bear_layer = nlay - 1 - l;
+      float dz = altitude[bear_layer + 1] - altitude[bear_layer];
+
+      float abs_bot  = abs_coeff[bear_layer       * nwav + w];
+      float abs_top  = abs_coeff[(bear_layer + 1) * nwav + w];
+      float scat_bot = scat_coeff[bear_layer       * nwav + w];
+      float scat_top = scat_coeff[(bear_layer + 1) * nwav + w];
+
+      float ext_bot = abs_bot + scat_bot;
+      float ext_top = abs_top + scat_top;
+
+      float tau = dz * (ext_top + ext_bot) * 0.5f;
+      float scat_depth = dz * (scat_top + scat_bot) * 0.5f;
+
+      if (tau < 0.0f) tau = 0.0f;
+      float ssa = (tau > 0.0f) ? scat_depth / tau : 0.0f;
+
+      ref_delta_tau[w * nlay + l] = tau;
+      ref_ssa      [w * nlay + l] = ssa;
+    }
+
+    for (int lev = 0; lev < nlev; ++lev) {
+      int bear_level = nlev - 1 - lev;
+      float wn = static_cast<float>(wavenumbers[w]);
+      ref_planck[w * nlev + lev] = planck_single_host(temperature[bear_level], wn);
+    }
+  }
+
+  // Surface emission = Planck at BOA for each wavenumber
+  std::vector<float> ref_surface_emission(nwav);
+  std::vector<float> ref_top_emission(nwav);
+  for (int w = 0; w < nwav; ++w) {
+    float wn = static_cast<float>(wavenumbers[w]);
+    ref_surface_emission[w] = planck_single_host(temperature[0], wn);
+    ref_top_emission[w]     = planck_single_host(temperature[nlev - 1], wn);
+  }
+
+  // --- Run reference: solveBatch with pre-computed values + per-wavenumber emission ---
+  // We must supply per-wavenumber surface/top emission because the raw path computes them
+  // from temperature via planck_single, and the standard path uses config scalars.
+  adrt::cuda::BatchConfig bcfg;
+  bcfg.num_wavenumbers = nwav;
+  bcfg.num_layers = nlay;
+  bcfg.num_quadrature = N;
+  bcfg.num_moments_max = nmom;
+  bcfg.use_thermal_emission = false;
+  bcfg.surface_albedo = 0.0;
+
+  // Allocate all device arrays for reference path
+  float* d_abs = nullptr;
+  float* d_scat = nullptr;
+  float* d_alt = nullptr;
+  float* d_temp = nullptr;
+  double* d_wn = nullptr;
+  float* d_pmom = nullptr;
+  float* d_flux_up = nullptr;
+  float* d_flux_down = nullptr;
+  float* d_flux_direct = nullptr;
+  float* d_ref_dtau = nullptr;
+  float* d_ref_ssa = nullptr;
+  float* d_ref_planck = nullptr;
+  float* d_ref_surf_em = nullptr;
+  float* d_ref_top_em = nullptr;
+
+  cudaMalloc(&d_abs,  nlev * nwav * sizeof(float));
+  cudaMalloc(&d_scat, nlev * nwav * sizeof(float));
+  cudaMalloc(&d_alt,  nlev * sizeof(float));
+  cudaMalloc(&d_temp, nlev * sizeof(float));
+  cudaMalloc(&d_wn,   nwav * sizeof(double));
+  cudaMalloc(&d_pmom, nlay * nmom * sizeof(float));
+  cudaMalloc(&d_flux_up,     nwav * sizeof(float));
+  cudaMalloc(&d_flux_down,   nwav * sizeof(float));
+  cudaMalloc(&d_flux_direct, nwav * sizeof(float));
+  cudaMalloc(&d_ref_dtau,    nwav * nlay * sizeof(float));
+  cudaMalloc(&d_ref_ssa,     nwav * nlay * sizeof(float));
+  cudaMalloc(&d_ref_planck,  nwav * nlev * sizeof(float));
+  cudaMalloc(&d_ref_surf_em, nwav * sizeof(float));
+  cudaMalloc(&d_ref_top_em,  nwav * sizeof(float));
+
+  cudaMemcpy(d_abs,  abs_coeff.data(),  nlev * nwav * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_scat, scat_coeff.data(), nlev * nwav * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_alt,  altitude,          nlev * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_temp, temperature,       nlev * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_wn,   wavenumbers,       nwav * sizeof(double), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_pmom, pmom.data(),       nlay * nmom * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_ref_dtau,    ref_delta_tau.data(),        nwav * nlay * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_ref_ssa,     ref_ssa.data(),              nwav * nlay * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_ref_planck,  ref_planck.data(),           nwav * nlev * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_ref_surf_em, ref_surface_emission.data(), nwav * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_ref_top_em,  ref_top_emission.data(),     nwav * sizeof(float), cudaMemcpyHostToDevice);
+
+  // Run reference with DeviceData (per-wavenumber emission)
+  adrt::cuda::DeviceData ref_dd;
+  ref_dd.delta_tau = d_ref_dtau;
+  ref_dd.single_scat_albedo = d_ref_ssa;
+  ref_dd.phase_moments = d_pmom;
+  ref_dd.phase_moments_shared = true;
+  ref_dd.planck_levels = d_ref_planck;
+  ref_dd.surface_emission = d_ref_surf_em;
+  ref_dd.top_emission = d_ref_top_em;
+  ref_dd.flux_up = d_flux_up;
+  ref_dd.flux_down = d_flux_down;
+  ref_dd.flux_direct = d_flux_direct;
+
+  adrt::cuda::solveBatch(bcfg, ref_dd);
+  cudaDeviceSynchronize();
+
+  std::vector<float> ref_flux_up(nwav), ref_flux_down(nwav);
+  cudaMemcpy(ref_flux_up.data(),   d_flux_up,   nwav * sizeof(float), cudaMemcpyDeviceToHost);
+  cudaMemcpy(ref_flux_down.data(), d_flux_down, nwav * sizeof(float), cudaMemcpyDeviceToHost);
+
+  adrt::cuda::RawDeviceData raw;
+  raw.absorption_coeff = d_abs;
+  raw.scattering_coeff = d_scat;
+  raw.altitude = d_alt;
+  raw.temperature = d_temp;
+  raw.wavenumber = d_wn;
+  raw.phase_moments = d_pmom;
+  raw.phase_moments_shared = true;
+  raw.flux_up = d_flux_up;
+  raw.flux_down = d_flux_down;
+  raw.flux_direct = d_flux_direct;
+
+  adrt::cuda::BatchConfig raw_bcfg;
+  raw_bcfg.num_wavenumbers = nwav;
+  raw_bcfg.num_layers = nlay;
+  raw_bcfg.num_quadrature = N;
+  raw_bcfg.num_moments_max = nmom;
+  raw_bcfg.surface_albedo = 0.0;
+
+  adrt::cuda::solveBatchFromCoefficients(raw_bcfg, raw);
+  cudaDeviceSynchronize();
+
+  // Copy results back
+  std::vector<float> test_flux_up(nwav), test_flux_down(nwav);
+  cudaMemcpy(test_flux_up.data(),   d_flux_up,   nwav * sizeof(float), cudaMemcpyDeviceToHost);
+  cudaMemcpy(test_flux_down.data(), d_flux_down, nwav * sizeof(float), cudaMemcpyDeviceToHost);
+
+  // Compare — tolerance accounts for __expf vs std::exp difference in Planck
+  float tol = 5e-4f;
+  for (int w = 0; w < nwav; ++w) {
+    char name[128];
+    snprintf(name, sizeof(name), "raw_input_flux_up[wn=%.0f]", wavenumbers[w]);
+    CHECK_NEAR(name, test_flux_up[w], ref_flux_up[w], tol);
+
+    snprintf(name, sizeof(name), "raw_input_flux_down[wn=%.0f]", wavenumbers[w]);
+    CHECK_NEAR(name, test_flux_down[w], ref_flux_down[w], tol);
+  }
+
+  // --- Test with cloud optical depth ---
+  std::vector<float> cloud_tau(nlay * nwav, 0.0f);
+  for (int l = 0; l < nlay; ++l)
+    for (int w = 0; w < nwav; ++w)
+      cloud_tau[l * nwav + w] = 0.01f * (l + 1);  // increasing with layer
+
+  // Reference: add cloud tau to delta_tau (with BOA→TOA reversal)
+  std::vector<float> ref_delta_tau_cloud(nwav * nlay);
+  std::vector<float> ref_ssa_cloud(nwav * nlay);
+  for (int w = 0; w < nwav; ++w) {
+    for (int l = 0; l < nlay; ++l) {
+      int bear_layer = nlay - 1 - l;
+      float cloud_contribution = cloud_tau[bear_layer * nwav + w];
+      float orig_scat_depth = ref_ssa[w * nlay + l] * ref_delta_tau[w * nlay + l];
+      ref_delta_tau_cloud[w * nlay + l] = ref_delta_tau[w * nlay + l] + cloud_contribution;
+      float new_tau = ref_delta_tau_cloud[w * nlay + l];
+      ref_ssa_cloud[w * nlay + l] = (new_tau > 0.0f) ? orig_scat_depth / new_tau : 0.0f;
+    }
+  }
+
+  // Upload cloud reference and run
+  float* d_ref_dtau_cloud = nullptr;
+  float* d_ref_ssa_cloud = nullptr;
+  cudaMalloc(&d_ref_dtau_cloud, nwav * nlay * sizeof(float));
+  cudaMalloc(&d_ref_ssa_cloud,  nwav * nlay * sizeof(float));
+  cudaMemcpy(d_ref_dtau_cloud, ref_delta_tau_cloud.data(), nwav * nlay * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_ref_ssa_cloud,  ref_ssa_cloud.data(),       nwav * nlay * sizeof(float), cudaMemcpyHostToDevice);
+
+  ref_dd.delta_tau = d_ref_dtau_cloud;
+  ref_dd.single_scat_albedo = d_ref_ssa_cloud;
+  adrt::cuda::solveBatch(bcfg, ref_dd);
+  cudaDeviceSynchronize();
+
+  std::vector<float> ref_cloud_flux_up(nwav), ref_cloud_flux_down(nwav);
+  cudaMemcpy(ref_cloud_flux_up.data(),   d_flux_up,   nwav * sizeof(float), cudaMemcpyDeviceToHost);
+  cudaMemcpy(ref_cloud_flux_down.data(), d_flux_down, nwav * sizeof(float), cudaMemcpyDeviceToHost);
+
+  // Upload cloud tau and run raw solver
+  float* d_cloud_tau = nullptr;
+  cudaMalloc(&d_cloud_tau, nlay * nwav * sizeof(float));
+  cudaMemcpy(d_cloud_tau, cloud_tau.data(), nlay * nwav * sizeof(float), cudaMemcpyHostToDevice);
+
+  raw.cloud_optical_depth = d_cloud_tau;
+  adrt::cuda::solveBatchFromCoefficients(raw_bcfg, raw);
+  cudaDeviceSynchronize();
+
+  cudaMemcpy(test_flux_up.data(),   d_flux_up,   nwav * sizeof(float), cudaMemcpyDeviceToHost);
+  cudaMemcpy(test_flux_down.data(), d_flux_down, nwav * sizeof(float), cudaMemcpyDeviceToHost);
+
+  for (int w = 0; w < nwav; ++w) {
+    char name[128];
+    snprintf(name, sizeof(name), "raw_input_cloud_flux_up[wn=%.0f]", wavenumbers[w]);
+    CHECK_NEAR(name, test_flux_up[w], ref_cloud_flux_up[w], tol);
+
+    snprintf(name, sizeof(name), "raw_input_cloud_flux_down[wn=%.0f]", wavenumbers[w]);
+    CHECK_NEAR(name, test_flux_down[w], ref_cloud_flux_down[w], tol);
+  }
+
+  // Cleanup
+  cudaFree(d_abs);
+  cudaFree(d_scat);
+  cudaFree(d_alt);
+  cudaFree(d_temp);
+  cudaFree(d_wn);
+  cudaFree(d_pmom);
+  cudaFree(d_flux_up);
+  cudaFree(d_flux_down);
+  cudaFree(d_flux_direct);
+  cudaFree(d_ref_dtau);
+  cudaFree(d_ref_ssa);
+  cudaFree(d_ref_planck);
+  cudaFree(d_ref_surf_em);
+  cudaFree(d_ref_top_em);
+  cudaFree(d_ref_dtau_cloud);
+  cudaFree(d_ref_ssa_cloud);
+  cudaFree(d_cloud_tau);
+
+  std::cout << "done\n";
+}
+
+
+// ============================================================================
 //  Main
 // ============================================================================
 
@@ -1584,6 +1875,9 @@ int main() {
   // Conservative stress tests
   test_conservative_thick();
   test_conservative_solar_energy();
+
+  // Raw-input entry point
+  test_raw_input_entry_point();
 
   int total = g_passed + g_failed;
   std::cout << "\n" << g_passed << "/" << total << " checks passed";

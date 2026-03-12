@@ -9,6 +9,7 @@
 #include "cuda_matrix.cuh"
 #include "cuda_phase_matrix.cuh"
 #include "cuda_planck.cuh"
+#include "cuda_planck_single.cuh"
 #include "cuda_quadrature.cuh"
 #include "cuda_warp_adding.cuh"
 #include "cuda_warp_doubling.cuh"
@@ -44,6 +45,7 @@ struct DeviceBatchConfig {
   float solar_mu;
   float wavenumber_low;
   float wavenumber_high;
+  float spectrum_scaling;
 };
 
 
@@ -142,7 +144,14 @@ __global__ void solveKernel(
     const float* __restrict__ precomp_Ppm,
     const float* __restrict__ precomp_f_trunc,
     const float* __restrict__ precomp_solar_pp,
-    const float* __restrict__ precomp_solar_pm)
+    const float* __restrict__ precomp_solar_pm,
+    // Raw-input pointers (all nullptr for pre-computed path)
+    const float* __restrict__ raw_abs_coeff,
+    const float* __restrict__ raw_scat_coeff,
+    const float* __restrict__ raw_altitude,
+    const float* __restrict__ raw_temperature,
+    const double* __restrict__ raw_wavenumber,
+    const float* __restrict__ raw_cloud_tau)
 {
   constexpr float PI = 3.14159265f;
 
@@ -153,14 +162,22 @@ __global__ void solveKernel(
   int nlev = nlay + 1;
   int two_M = 2 * N;
   bool has_solar = (cfg.solar_flux > 0.0f && cfg.solar_mu > 0.0f);
+  bool has_raw = (raw_abs_coeff != nullptr);
 
   // --- 1. Planck / thermal source setup ---
   // Instead of storing all B[nlev] on the stack, we load values on the fly
   // during the layer loop. Here we only determine the surface/top values.
 
   // Helper lambda to load a single Planck level value
+  // For ADRT level index (TOA=0, BOA=nlay).
   auto loadB = [&](int level) -> float {
-    if (cfg.use_thermal_emission && temperature != nullptr)
+    if (has_raw) {
+      // Raw path: single-wavenumber Planck from reversed level indices
+      int bear_level = nlev - 1 - level;  // TOA→BOA reversal
+      float wn = static_cast<float>(raw_wavenumber[w]);
+      return planck_single(raw_temperature[bear_level], wn);
+    }
+    else if (cfg.use_thermal_emission && temperature != nullptr)
       return planck_function(
           static_cast<double>(cfg.wavenumber_low),
           static_cast<double>(cfg.wavenumber_high),
@@ -171,10 +188,44 @@ __global__ void solveKernel(
       return 0.0f;
   };
 
+  // Helper lambda to compute tau and ssa for ADRT layer l (TOA=0) from raw inputs.
+  // Returns via output references.
+  auto loadTauSsa = [&](int l, float& out_tau, float& out_ssa) {
+    if (has_raw) {
+      // Map ADRT layer l (TOA=0) to BeAR layer (BOA=0)
+      int bear_layer = nlay - 1 - l;
+      float dz = raw_altitude[bear_layer + 1] - raw_altitude[bear_layer];
+
+      float abs_bot  = raw_abs_coeff [bear_layer       * cfg.nwav + w];
+      float abs_top  = raw_abs_coeff [(bear_layer + 1) * cfg.nwav + w];
+      float scat_bot = raw_scat_coeff[bear_layer       * cfg.nwav + w];
+      float scat_top = raw_scat_coeff[(bear_layer + 1) * cfg.nwav + w];
+
+      float ext_bot = abs_bot + scat_bot;
+      float ext_top = abs_top + scat_top;
+
+      out_tau = dz * (ext_top + ext_bot) * 0.5f;
+      float scat_depth = dz * (scat_top + scat_bot) * 0.5f;
+
+      if (raw_cloud_tau != nullptr)
+        out_tau += raw_cloud_tau[bear_layer * cfg.nwav + w];
+
+      if (out_tau < 0.0f) out_tau = 0.0f;
+      out_ssa = (out_tau > 0.0f) ? scat_depth / out_tau : 0.0f;
+    } else {
+      out_tau = delta_tau[w * nlay + l];
+      out_ssa = single_scat_albedo[w * nlay + l];
+    }
+  };
+
   float B_surface = 0.0f;
   float B_top_emission = 0.0f;
 
-  if (cfg.use_thermal_emission && temperature != nullptr) {
+  if (has_raw) {
+    B_surface = loadB(nlay);     // Planck at BOA
+    B_top_emission = loadB(0);   // Will be overridden after loop if thermal
+  }
+  else if (cfg.use_thermal_emission && temperature != nullptr) {
     B_surface = loadB(nlay);
     // B_top_emission will be set after the layer loop (= B at level 0)
   }
@@ -197,8 +248,11 @@ __global__ void solveKernel(
 
   // Compute total optical depth (needed for surface solar beam)
   float tau_total = 0.0f;
-  for (int l = 0; l < nlay; ++l)
-    tau_total += delta_tau[w * nlay + l];
+  for (int l = 0; l < nlay; ++l) {
+    float t, s;
+    loadTauSsa(l, t, s);
+    tau_total += t;
+  }
 
   // Surface layer (if applicable)
   bool has_surface = !cfg.use_diffusion_lower_bc
@@ -244,8 +298,8 @@ __global__ void solveKernel(
   float B_prev = loadB(nlay);
 
   for (int l = nlay - 1; l >= 0; --l) {
-    float tau_layer = delta_tau[w * nlay + l];
-    float omega_layer = single_scat_albedo[w * nlay + l];
+    float tau_layer, omega_layer;
+    loadTauSsa(l, tau_layer, omega_layer);
     float B_layer_top = loadB(l);
     float B_layer_bot = B_prev;
     B_prev = B_layer_top;
@@ -257,6 +311,7 @@ __global__ void solveKernel(
       continue;
 
     float tau_cumulative = tau_above;
+    float tau_layer_orig = tau_layer;  // save unscaled value for delta-M
 
     // Build phase matrices (precomputed or on-the-fly)
     GpuMatrix<N> Ppp, Ppm;
@@ -267,7 +322,7 @@ __global__ void solveKernel(
       float f_trunc = precomp_f_trunc[l];
       if (cfg.use_delta_m && f_trunc > 0.0f && omega_layer > 0.0f && tau_layer > 0.0f) {
         float omega_f = omega_layer * f_trunc;
-        tau_layer   = (1.0f - omega_f) * delta_tau[w * nlay + l];
+        tau_layer   = (1.0f - omega_f) * tau_layer_orig;
         omega_layer = omega_layer * (1.0f - f_trunc) / (1.0f - omega_f);
       }
 
@@ -308,7 +363,7 @@ __global__ void solveKernel(
 
         if (f_trunc > 1e-12f && f_trunc < 1.0f - 1e-12f) {
           float omega_f = omega_layer * f_trunc;
-          tau_layer   = (1.0f - omega_f) * delta_tau[w * nlay + l];
+          tau_layer   = (1.0f - omega_f) * tau_layer_orig;
           omega_layer = omega_layer * (1.0f - f_trunc) / (1.0f - omega_f);
 
           for (int m = 0; m < two_M; ++m)
@@ -358,7 +413,7 @@ __global__ void solveKernel(
   }
 
   // B_prev now holds B[0] (the topmost level value)
-  if (cfg.use_thermal_emission && temperature != nullptr)
+  if (has_raw || (cfg.use_thermal_emission && temperature != nullptr))
     B_top_emission = B_prev;
 
   // --- 3. Boundary intensities ---
@@ -371,8 +426,9 @@ __global__ void solveKernel(
   if (cfg.use_diffusion_lower_bc) {
     float B_bottom = loadB(nlay);
     float B_second_last = loadB(nlay - 1);
-    float dtau_last = delta_tau[w * nlay + (nlay - 1)];
-    float dB_dtau = (dtau_last > 0.0f) ? (B_bottom - B_second_last) / dtau_last : 0.0f;
+    float dtau_last_t, dtau_last_s;
+    loadTauSsa(nlay - 1, dtau_last_t, dtau_last_s);
+    float dB_dtau = (dtau_last_t > 0.0f) ? (B_bottom - B_second_last) / dtau_last_t : 0.0f;
     #pragma unroll
     for (int i = 0; i < N; ++i)
       I_bot_up[i] = B_bottom + d_mu[i] * dB_dtau;
@@ -398,7 +454,7 @@ __global__ void solveKernel(
   }
 
   if (flux_up_out != nullptr)
-    flux_up_out[w] = F_up;
+    flux_up_out[w] = F_up * cfg.spectrum_scaling;
   if (flux_down_out != nullptr)
     flux_down_out[w] = F_down;
 
@@ -742,7 +798,7 @@ __global__ void solveKernelWarp(
   // Only lane 0 of each group writes the output
   if (row_id == 0) {
     if (flux_up_out != nullptr)
-      flux_up_out[w] = F_up;
+      flux_up_out[w] = F_up * cfg.spectrum_scaling;
     if (flux_down_out != nullptr)
       flux_down_out[w] = F_down;
 
@@ -788,6 +844,7 @@ void solveBatch(
   dcfg.solar_mu = static_cast<float>(config.solar_mu);
   dcfg.wavenumber_low = static_cast<float>(config.wavenumber_low);
   dcfg.wavenumber_high = static_cast<float>(config.wavenumber_high);
+  dcfg.spectrum_scaling = static_cast<float>(config.spectrum_scaling);
 
   int nlay = config.num_layers;
   int N = config.num_quadrature;
@@ -870,7 +927,8 @@ void solveBatch(
         data.surface_emission, data.top_emission, \
         data.flux_up, data.flux_down, data.flux_direct, \
         d_precomp_Ppp, d_precomp_Ppm, d_precomp_f_trunc, \
-        d_precomp_solar_pp, d_precomp_solar_pm); }
+        d_precomp_solar_pp, d_precomp_solar_pm, \
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr); }
 
   #define LAUNCH_WARP_SOLVE_KERNEL(NQ) \
     { int groups_per_block = threads_per_block / NQ; \
@@ -993,6 +1051,265 @@ HostResult solveBatchHost(
 
   return result;
 }
+
+// ============================================================================
+//  SolverWorkspaceGPU: persistent GPU workspace for N > 8 path
+// ============================================================================
+
+void SolverWorkspaceGPU::allocate(int nwav, int nlay) {
+  if (nwav == allocated_nwav && nlay == allocated_nlay)
+    return;
+
+  free();
+
+  int nlev = nlay + 1;
+  cudaMalloc(&delta_tau,          nwav * nlay * sizeof(float));
+  cudaMalloc(&single_scat_albedo, nwav * nlay * sizeof(float));
+  cudaMalloc(&planck_levels,      nwav * nlev * sizeof(float));
+  cudaMalloc(&surface_emission,   nwav * sizeof(float));
+  cudaMalloc(&top_emission,       nwav * sizeof(float));
+
+  allocated_nwav = nwav;
+  allocated_nlay = nlay;
+}
+
+void SolverWorkspaceGPU::free() {
+  if (delta_tau)          { cudaFree(delta_tau);          delta_tau = nullptr; }
+  if (single_scat_albedo) { cudaFree(single_scat_albedo); single_scat_albedo = nullptr; }
+  if (planck_levels)      { cudaFree(planck_levels);      planck_levels = nullptr; }
+  if (surface_emission)   { cudaFree(surface_emission);   surface_emission = nullptr; }
+  if (top_emission)       { cudaFree(top_emission);       top_emission = nullptr; }
+  allocated_nwav = 0;
+  allocated_nlay = 0;
+}
+
+
+// ============================================================================
+//  Preprocess kernel: raw coefficients → delta_tau, ssa, planck (for N > 8)
+// ============================================================================
+
+__global__ void preprocessRawKernel(
+    int nwav, int nlay,
+    const float* __restrict__ abs_coeff,
+    const float* __restrict__ scat_coeff,
+    const float* __restrict__ altitude,
+    const float* __restrict__ temperature,
+    const double* __restrict__ wavenumber,
+    const float* __restrict__ cloud_tau,
+    float* __restrict__ out_delta_tau,
+    float* __restrict__ out_ssa,
+    float* __restrict__ out_planck,
+    float* __restrict__ out_surface_emission,
+    float* __restrict__ out_top_emission)
+{
+  int w = blockIdx.x * blockDim.x + threadIdx.x;
+  if (w >= nwav) return;
+
+  int nlev = nlay + 1;
+  float wn = static_cast<float>(wavenumber[w]);
+
+  // Compute delta_tau and ssa for each layer (ADRT ordering: TOA=0)
+  for (int l = 0; l < nlay; ++l) {
+    int bear_layer = nlay - 1 - l;
+    float dz = altitude[bear_layer + 1] - altitude[bear_layer];
+
+    float abs_bot  = abs_coeff [bear_layer       * nwav + w];
+    float abs_top  = abs_coeff [(bear_layer + 1) * nwav + w];
+    float scat_bot = scat_coeff[bear_layer       * nwav + w];
+    float scat_top = scat_coeff[(bear_layer + 1) * nwav + w];
+
+    float ext_bot = abs_bot + scat_bot;
+    float ext_top = abs_top + scat_top;
+
+    float tau = dz * (ext_top + ext_bot) * 0.5f;
+    float scat_depth = dz * (scat_top + scat_bot) * 0.5f;
+
+    if (cloud_tau != nullptr)
+      tau += cloud_tau[bear_layer * nwav + w];
+
+    if (tau < 0.0f) tau = 0.0f;
+    float ssa = (tau > 0.0f) ? scat_depth / tau : 0.0f;
+
+    out_delta_tau[w * nlay + l] = tau;
+    out_ssa      [w * nlay + l] = ssa;
+  }
+
+  // Compute Planck at each level (ADRT ordering: TOA=0)
+  for (int lev = 0; lev < nlev; ++lev) {
+    int bear_level = nlev - 1 - lev;
+    out_planck[w * nlev + lev] = planck_single(temperature[bear_level], wn);
+  }
+
+  // Surface and top emission
+  out_surface_emission[w] = planck_single(temperature[0], wn);      // BOA
+  out_top_emission[w]     = planck_single(temperature[nlev - 1], wn); // TOA
+}
+
+
+// ============================================================================
+//  solveBatchFromCoefficients: zero-allocation path (N ≤ 8)
+// ============================================================================
+
+void solveBatchFromCoefficients(
+    const BatchConfig& config,
+    const RawDeviceData& data,
+    cudaStream_t stream)
+{
+  int N = config.num_quadrature;
+  int L = config.num_moments_max;
+  if (L > MAX_NMOM) L = MAX_NMOM;
+  uploadQuadratureData(N, L);
+
+  if (N > 8) {
+    fprintf(stderr, "solveBatchFromCoefficients: N > 8 requires workspace overload.\n");
+    return;
+  }
+
+  // Build device config — thermal is handled via raw inputs
+  DeviceBatchConfig dcfg;
+  dcfg.nwav = config.num_wavenumbers;
+  dcfg.nlay = config.num_layers;
+  dcfg.nmu  = N;
+  dcfg.nmom_max = config.num_moments_max;
+  dcfg.use_delta_m = config.use_delta_m;
+  dcfg.use_thermal_emission = false;  // Planck computed inline from raw_temperature
+  dcfg.use_diffusion_lower_bc = config.use_diffusion_lower_bc;
+  dcfg.phase_moments_shared = data.phase_moments_shared;
+  dcfg.surface_albedo = static_cast<float>(config.surface_albedo);
+  dcfg.surface_emission = 0.0f;  // computed inline
+  dcfg.top_emission = 0.0f;      // computed inline
+  dcfg.solar_flux = static_cast<float>(config.solar_flux);
+  dcfg.solar_mu = static_cast<float>(config.solar_mu);
+  dcfg.wavenumber_low = 0.0f;
+  dcfg.wavenumber_high = 0.0f;
+  dcfg.spectrum_scaling = static_cast<float>(config.spectrum_scaling);
+
+  int nlay = config.num_layers;
+  bool has_solar = (config.solar_flux > 0.0 && config.solar_mu > 0.0);
+
+  // Precompute phase matrices (shared moments path)
+  float *d_precomp_Ppp = nullptr, *d_precomp_Ppm = nullptr;
+  float *d_precomp_f_trunc = nullptr;
+  float *d_precomp_solar_pp = nullptr, *d_precomp_solar_pm = nullptr;
+
+  if (data.phase_moments_shared) {
+    cudaMalloc(&d_precomp_Ppp, nlay * N * N * sizeof(float));
+    cudaMalloc(&d_precomp_Ppm, nlay * N * N * sizeof(float));
+    cudaMalloc(&d_precomp_f_trunc, nlay * sizeof(float));
+
+    if (has_solar) {
+      cudaMalloc(&d_precomp_solar_pp, nlay * N * sizeof(float));
+      cudaMalloc(&d_precomp_solar_pm, nlay * N * sizeof(float));
+    }
+
+    int precomp_threads = 64;
+    int precomp_blocks = (nlay + precomp_threads - 1) / precomp_threads;
+    float solar_mu_f = static_cast<float>(config.solar_mu);
+
+    switch (N) {
+      case 2:
+        precomputePhaseKernel<2><<<precomp_blocks, precomp_threads, 0, stream>>>(
+            nlay, config.num_moments_max, config.use_delta_m,
+            solar_mu_f, has_solar, data.phase_moments,
+            d_precomp_Ppp, d_precomp_Ppm, d_precomp_f_trunc,
+            d_precomp_solar_pp, d_precomp_solar_pm);
+        break;
+      case 4:
+        precomputePhaseKernel<4><<<precomp_blocks, precomp_threads, 0, stream>>>(
+            nlay, config.num_moments_max, config.use_delta_m,
+            solar_mu_f, has_solar, data.phase_moments,
+            d_precomp_Ppp, d_precomp_Ppm, d_precomp_f_trunc,
+            d_precomp_solar_pp, d_precomp_solar_pm);
+        break;
+      case 8:
+        precomputePhaseKernel<8><<<precomp_blocks, precomp_threads, 0, stream>>>(
+            nlay, config.num_moments_max, config.use_delta_m,
+            solar_mu_f, has_solar, data.phase_moments,
+            d_precomp_Ppp, d_precomp_Ppm, d_precomp_f_trunc,
+            d_precomp_solar_pp, d_precomp_solar_pm);
+        break;
+    }
+  }
+
+  int threads_per_block = 128;
+
+  #define LAUNCH_RAW_KERNEL(NQ) \
+    { int num_blocks = (config.num_wavenumbers + threads_per_block - 1) / threads_per_block; \
+      solveKernel<NQ><<<num_blocks, threads_per_block, 0, stream>>>( \
+        dcfg, nullptr, nullptr, data.phase_moments, \
+        nullptr, nullptr, nullptr, nullptr, \
+        data.flux_up, data.flux_down, data.flux_direct, \
+        d_precomp_Ppp, d_precomp_Ppm, d_precomp_f_trunc, \
+        d_precomp_solar_pp, d_precomp_solar_pm, \
+        data.absorption_coeff, data.scattering_coeff, \
+        data.altitude, data.temperature, data.wavenumber, \
+        data.cloud_optical_depth); }
+
+  switch (N) {
+    case 2: LAUNCH_RAW_KERNEL(2); break;
+    case 4: LAUNCH_RAW_KERNEL(4); break;
+    case 8: LAUNCH_RAW_KERNEL(8); break;
+  }
+
+  #undef LAUNCH_RAW_KERNEL
+
+  // Free precomputed arrays
+  if (stream != 0)
+    cudaStreamSynchronize(stream);
+
+  if (d_precomp_Ppp) cudaFree(d_precomp_Ppp);
+  if (d_precomp_Ppm) cudaFree(d_precomp_Ppm);
+  if (d_precomp_f_trunc) cudaFree(d_precomp_f_trunc);
+  if (d_precomp_solar_pp) cudaFree(d_precomp_solar_pp);
+  if (d_precomp_solar_pm) cudaFree(d_precomp_solar_pm);
+}
+
+
+// ============================================================================
+//  solveBatchFromCoefficients: workspace path (N > 8)
+// ============================================================================
+
+void solveBatchFromCoefficients(
+    const BatchConfig& config,
+    const RawDeviceData& data,
+    SolverWorkspaceGPU& workspace,
+    cudaStream_t stream)
+{
+  int nwav = config.num_wavenumbers;
+  int nlay = config.num_layers;
+  int nlev = nlay + 1;
+
+  // Allocate workspace if needed
+  workspace.allocate(nwav, nlay);
+
+  // Preprocess: convert raw coefficients to delta_tau, ssa, planck
+  int threads = 128;
+  int blocks = (nwav + threads - 1) / threads;
+  preprocessRawKernel<<<blocks, threads, 0, stream>>>(
+      nwav, nlay,
+      data.absorption_coeff, data.scattering_coeff,
+      data.altitude, data.temperature, data.wavenumber,
+      data.cloud_optical_depth,
+      workspace.delta_tau, workspace.single_scat_albedo,
+      workspace.planck_levels,
+      workspace.surface_emission, workspace.top_emission);
+
+  // Now call the standard solveBatch with preprocessed data
+  DeviceData dd;
+  dd.delta_tau = workspace.delta_tau;
+  dd.single_scat_albedo = workspace.single_scat_albedo;
+  dd.phase_moments = data.phase_moments;
+  dd.phase_moments_shared = data.phase_moments_shared;
+  dd.planck_levels = workspace.planck_levels;
+  dd.surface_emission = workspace.surface_emission;
+  dd.top_emission = workspace.top_emission;
+  dd.flux_up = data.flux_up;
+  dd.flux_down = data.flux_down;
+  dd.flux_direct = data.flux_direct;
+
+  solveBatch(config, dd, stream);
+}
+
 
 } // namespace cuda
 } // namespace adrt

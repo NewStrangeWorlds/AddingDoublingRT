@@ -33,6 +33,8 @@ struct BatchConfig {
 
   double wavenumber_low = 0.0;   ///< For Planck function (thermal only)
   double wavenumber_high = 0.0;
+
+  double spectrum_scaling = 1.0;  ///< Constant factor applied to flux_up only (e.g. 1e-3 * (Rp/Rs)²)
 };
 
 
@@ -92,6 +94,87 @@ HostResult solveBatchHost(
     bool phase_moments_shared,
     const std::vector<float>& planck_levels,        // [nwav * nlev] or empty
     const std::vector<float>& temperature = {});    // [nwav * nlev] or empty
+
+
+// ============================================================================
+//  Raw-input interface (for retrieval codes like BeAR)
+// ============================================================================
+
+/// Device memory pointers for solving from raw retrieval inputs.
+///
+/// Coefficient arrays use level-major layout: array[level * nwav + wav],
+/// with BOA (bottom of atmosphere) at index 0. The solver internally
+/// reverses the ordering to TOA-first as required by the adding-doubling
+/// algorithm. Single-wavenumber Planck B(T, ν) is computed inline.
+struct RawDeviceData {
+  // --- Inputs (caller-owned device memory, level-major, BOA = index 0) ---
+
+  const float* absorption_coeff;     ///< [nlev * nwav] absorption coefficient (cm⁻¹)
+  const float* scattering_coeff;     ///< [nlev * nwav] scattering coefficient (cm⁻¹)
+  const float* altitude;             ///< [nlev] altitude (cm), BOA = index 0
+  const float* temperature;          ///< [nlev] temperature (K), BOA = index 0
+  const double* wavenumber;          ///< [nwav] wavenumber (cm⁻¹)
+
+  // --- Phase function (same convention as DeviceData) ---
+
+  const float* phase_moments;        ///< [nlay * nmom] or [nwav * nlay * nmom]
+  bool phase_moments_shared = false; ///< true if moments are shared across wavenumbers
+
+  // --- Optional cloud contribution (level-major, BOA = index 0) ---
+
+  const float* cloud_optical_depth = nullptr;  ///< [nlay * nwav] or nullptr
+
+  // --- Outputs (caller-owned device memory) ---
+
+  float* flux_up = nullptr;          ///< [nwav] TOA upward flux
+  float* flux_down = nullptr;        ///< [nwav] TOA downward flux
+  float* flux_direct = nullptr;      ///< [nwav] direct solar flux at surface, or nullptr
+};
+
+
+/// Persistent GPU workspace for the cuBLAS solver path (N > 8).
+/// Not needed for N ≤ 8 (optical properties computed inline, zero allocation).
+/// Allocate once and reuse across retrieval iterations.
+struct SolverWorkspaceGPU {
+  float* delta_tau = nullptr;          ///< [nwav * nlay]
+  float* single_scat_albedo = nullptr; ///< [nwav * nlay]
+  float* planck_levels = nullptr;      ///< [nwav * nlev]
+  float* surface_emission = nullptr;   ///< [nwav]
+  float* top_emission = nullptr;       ///< [nwav]
+  int allocated_nwav = 0;
+  int allocated_nlay = 0;
+
+  /// Allocate (or re-allocate if dimensions changed).
+  void allocate(int nwav, int nlay);
+
+  /// Free all device memory.
+  void free();
+
+  ~SolverWorkspaceGPU() { free(); }
+};
+
+
+/// Solve from raw retrieval inputs (N ≤ 8, zero allocation).
+///
+/// Computes optical depths via trapezoidal rule, SSA, and single-wavenumber
+/// Planck function inline inside the solver kernel. No intermediate device
+/// arrays are allocated — suitable for large wavenumber counts.
+///
+/// For N > 8, use the overload that accepts a SolverWorkspaceGPU.
+void solveBatchFromCoefficients(
+    const BatchConfig& config,
+    const RawDeviceData& data,
+    cudaStream_t stream = 0);
+
+/// Solve from raw retrieval inputs (N > 8, workspace required).
+///
+/// Preprocesses raw inputs into intermediate arrays stored in the workspace,
+/// then calls the cuBLAS-based solver.
+void solveBatchFromCoefficients(
+    const BatchConfig& config,
+    const RawDeviceData& data,
+    SolverWorkspaceGPU& workspace,
+    cudaStream_t stream = 0);
 
 
 } // namespace cuda
