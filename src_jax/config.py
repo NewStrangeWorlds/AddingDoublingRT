@@ -90,7 +90,7 @@ class ADConfig:
             for l in range(self.num_layers + 1):
                 if self.temperature[l] < 0.0:
                     raise ValueError(f"temperature[{l}] < 0")
-            if self.wavenumber_low < 0.0 or self.wavenumber_high <= self.wavenumber_low:
+            if self.wavenumber_low < 0.0 or self.wavenumber_high < self.wavenumber_low:
                 raise ValueError("invalid wavenumber range")
 
     def set_henyey_greenstein(self, g, layer=-1):
