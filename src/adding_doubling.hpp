@@ -136,7 +136,7 @@ public:
       for (int l = 0; l <= num_layers; ++l)
         if (temperature[l] < 0.0)
           throw std::invalid_argument("ADConfig: temperature[" + std::to_string(l) + "] < 0");
-      if (wavenumber_low < 0.0 || wavenumber_high <= wavenumber_low)
+      if (wavenumber_low < 0.0 || wavenumber_high < wavenumber_low)
         throw std::invalid_argument("ADConfig: invalid wavenumber range");
     }
 

@@ -807,7 +807,7 @@ static RTOutput solveDynamic(
   for (int i = 0; i < nmu; ++i)
     xfac_sum += mu[i] * wt[i];
   
-    double xfac = 0.5 / xfac_sum;
+  double xfac = 0.5 / xfac_sum;
 
   std::vector<double> B(nlay + 1, 0.0);
   double B_surface = 0.0;
