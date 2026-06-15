@@ -502,7 +502,7 @@ static DynLayerMatrices dynAddLayersNonscatTop(
     for (int i = 0; i < n; ++i)
       ans_up[i] = s1_up[i] + t[i] * (s2_up[i] + Rbc_s1m[i]);
     
-      auto Tbc_s1m = bot.T_ab.multiply(s1_down);
+    auto Tbc_s1m = bot.T_ab.multiply(s1_down);
     
     for (int i = 0; i < n; ++i)
       ans_down[i] = s2_down[i] + Tbc_s1m[i];
