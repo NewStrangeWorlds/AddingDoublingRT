@@ -119,8 +119,13 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
   {
     for (int l = 0; l <= nlay; ++l)
       B[l] = planckFunction(cfg.wavenumber_low, cfg.wavenumber_high, cfg.temperature[l]);
-    
-    B_surface = B[nlay];
+
+    // Surface (skin) emission. By default the surface emits at the bottom
+    // level temperature; a distinct surface temperature decouples the radiating
+    // ground from the adjacent atmospheric layer (skin-temperature discontinuity).
+    B_surface = (cfg.surface_temperature >= 0.0)
+                  ? planckFunction(cfg.wavenumber_low, cfg.wavenumber_high, cfg.surface_temperature)
+                  : B[nlay];
     B_top_emission = B[0];
   }
   else if (static_cast<int>(cfg.planck_levels.size()) == nlay + 1) 
@@ -817,8 +822,13 @@ static RTOutput solveDynamic(
   {
     for (int l = 0; l <= nlay; ++l)
       B[l] = planckFunction(cfg.wavenumber_low, cfg.wavenumber_high, cfg.temperature[l]);
-    
-    B_surface = B[nlay];
+
+    // Surface (skin) emission. By default the surface emits at the bottom
+    // level temperature; a distinct surface temperature decouples the radiating
+    // ground from the adjacent atmospheric layer (skin-temperature discontinuity).
+    B_surface = (cfg.surface_temperature >= 0.0)
+                  ? planckFunction(cfg.wavenumber_low, cfg.wavenumber_high, cfg.surface_temperature)
+                  : B[nlay];
     B_top_emission = B[0];
   }
   else if (static_cast<int>(cfg.planck_levels.size()) == nlay + 1) 

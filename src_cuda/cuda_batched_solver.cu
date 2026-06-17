@@ -845,6 +845,8 @@ void solveBatchedCublas(
         static_cast<float>(config.surface_emission),
         solar_flux, solar_mu, has_solar,
         config.use_thermal_emission,
+        static_cast<float>(config.surface_temperature),
+        config.wavenumber_low, config.wavenumber_high,
         ws.d_mu_rt, ws.d_wt_rt, ws.d_xfac_rt,
         data.surface_emission, ws.tau_total,
         ws.B_levels, nlev,
@@ -854,8 +856,13 @@ void solveBatchedCublas(
     comp_initialized = true;
   }
 
-  // Precompute uniform nn_max across all layers (single host sync)
+  // Precompute uniform nn_max across all layers (single host sync).
+  // Also flag layers that are pure absorption (omega == 0) for ALL wavenumbers:
+  // those are solved analytically (T = exp(-tau/mu)) rather than by doubling,
+  // which is unstable for non-scattering layers at large N (mirrors the CPU and
+  // N<=8 paths, which branch to an analytic pure-absorption case).
   int nn_max_global;
+  std::vector<char> layer_pure_abs(nlay, 0);
   {
     std::vector<float> all_tau(nwav * nlay), all_omega(nwav * nlay);
     cudaMemcpyAsync(all_tau.data(), data.delta_tau, nwav * nlay * sizeof(float),
@@ -868,10 +875,13 @@ void solveBatchedCublas(
     for (int l = 0; l < nlay; ++l) {
       // Extract per-wavenumber tau and omega for this layer
       std::vector<float> tau_l(nwav), omega_l(nwav);
+      bool pure_abs = true;
       for (int w = 0; w < nwav; ++w) {
         tau_l[w] = all_tau[w * nlay + l];
         omega_l[w] = all_omega[w * nlay + l];
+        if (omega_l[w] > 0.0f) pure_abs = false;
       }
+      layer_pure_abs[l] = pure_abs ? 1 : 0;
       int nn = batched::computeNnMax(tau_l, omega_l, nwav);
       nn_max_global = std::max(nn_max_global, nn);
     }
@@ -904,15 +914,26 @@ void solveBatchedCublas(
           ws.omega_scaled, ws.omega_scaled);
     }
 
-    // Compute B_bar and B_d
-    batchedComputeBBarBdKernel<<<divUp(nwav, BLOCK), BLOCK, 0, stream>>>(
-        nwav, nlay, l, ws.B_levels, ws.tau_scaled, ws.B_bar, ws.B_d);
+    if (layer_pure_abs[l]) {
+      // Analytic pure-absorption layer: T = exp(-tau/mu), R = 0, thermal source
+      // exact. Avoids the doubling instability for non-scattering layers.
+      size_t mat_total = (size_t)nwav * N * N;
+      size_t vec_total = (size_t)nwav * N;
+      batchedPureAbsorptionKernel<<<divUp(std::max(mat_total, vec_total), BLOCK), BLOCK, 0, stream>>>(
+          nwav, N, ws.tau_scaled, ws.B_levels, nlev, l, ws.d_mu_rt,
+          ws.cur_T_ab, ws.cur_T_ba, ws.cur_R_ab, ws.cur_R_ba,
+          ws.cur_s_up, ws.cur_s_down, ws.cur_s_up_solar, ws.cur_s_down_solar);
+    } else {
+      // Compute B_bar and B_d
+      batchedComputeBBarBdKernel<<<divUp(nwav, BLOCK), BLOCK, 0, stream>>>(
+          nwav, nlay, l, ws.B_levels, ws.tau_scaled, ws.B_bar, ws.B_d);
 
-    // Doubling
-    batchedDoubling(ws, stream, l,
-                    solar_flux, solar_mu,
-                    ws.tau_above,
-                    has_solar, nn_max_global);
+      // Doubling
+      batchedDoubling(ws, stream, l,
+                      solar_flux, solar_mu,
+                      ws.tau_above,
+                      has_solar, nn_max_global);
+    }
 
     // Adding
     if (!comp_initialized) {
@@ -947,6 +968,8 @@ void solveBatchedCublas(
       nwav, N, ws.B_levels, nlev,
       static_cast<float>(config.top_emission),
       static_cast<float>(config.surface_emission),
+      static_cast<float>(config.surface_temperature),
+      config.wavenumber_low, config.wavenumber_high,
       config.use_thermal_emission,
       config.use_diffusion_lower_bc,
       has_surface,

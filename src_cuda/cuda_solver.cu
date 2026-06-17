@@ -40,6 +40,7 @@ struct DeviceBatchConfig {
 
   float surface_albedo;
   float surface_emission;
+  float surface_temperature;
   float top_emission;
   float solar_flux;
   float solar_mu;
@@ -234,6 +235,17 @@ __global__ void solveKernel(
                   ? per_wav_surface_emission[w] : cfg.surface_emission;
     B_top_emission = (per_wav_top_emission != nullptr)
                        ? per_wav_top_emission[w] : cfg.top_emission;
+  }
+
+  // Decoupled surface (skin) temperature: emit at surface_temperature instead
+  // of the bottom level temperature. Only meaningful with thermal emission.
+  if (cfg.surface_temperature >= 0.0f && (has_raw || cfg.use_thermal_emission)) {
+    B_surface = has_raw
+                  ? planck_single(cfg.surface_temperature,
+                                  static_cast<float>(raw_wavenumber[w]))
+                  : planck_function(static_cast<double>(cfg.wavenumber_low),
+                                    static_cast<double>(cfg.wavenumber_high),
+                                    static_cast<double>(cfg.surface_temperature));
   }
 
   // --- 2. Process layers: doubling + bottom-up adding (fused) ---
@@ -531,6 +543,13 @@ __global__ void solveKernelWarp(
                   ? per_wav_surface_emission[w] : cfg.surface_emission;
     B_top_emission = (per_wav_top_emission != nullptr)
                        ? per_wav_top_emission[w] : cfg.top_emission;
+  }
+
+  // Decoupled surface (skin) temperature (thermal emission only).
+  if (cfg.surface_temperature >= 0.0f && cfg.use_thermal_emission) {
+    B_surface = planck_function(static_cast<double>(cfg.wavenumber_low),
+                                static_cast<double>(cfg.wavenumber_high),
+                                static_cast<double>(cfg.surface_temperature));
   }
 
   // --- 2. Process layers: doubling + bottom-up adding (fused) ---
@@ -839,6 +858,7 @@ void solveBatch(
   dcfg.phase_moments_shared = data.phase_moments_shared;
   dcfg.surface_albedo = static_cast<float>(config.surface_albedo);
   dcfg.surface_emission = static_cast<float>(config.surface_emission);
+  dcfg.surface_temperature = static_cast<float>(config.surface_temperature);
   dcfg.top_emission = static_cast<float>(config.top_emission);
   dcfg.solar_flux = static_cast<float>(config.solar_flux);
   dcfg.solar_mu = static_cast<float>(config.solar_mu);
@@ -1177,6 +1197,7 @@ void solveBatchFromCoefficients(
   dcfg.phase_moments_shared = data.phase_moments_shared;
   dcfg.surface_albedo = static_cast<float>(config.surface_albedo);
   dcfg.surface_emission = 0.0f;  // computed inline
+  dcfg.surface_temperature = static_cast<float>(config.surface_temperature);
   dcfg.top_emission = 0.0f;      // computed inline
   dcfg.solar_flux = static_cast<float>(config.solar_flux);
   dcfg.solar_mu = static_cast<float>(config.solar_mu);

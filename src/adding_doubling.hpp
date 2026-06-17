@@ -62,6 +62,7 @@ public:
   // ======== Boundary conditions ========
   double surface_albedo = 0.0;      ///< Lambertian surface albedo [0, 1]
   double surface_emission = 0.0;    ///< Raw surface thermal emission (only if !use_thermal_emission)
+  double surface_temperature = -1.0; ///< Surface (skin) temperature [K]; if >= 0 and use_thermal_emission, the surface emits at this temperature instead of the bottom level temperature[num_layers]
   double top_emission = 0.0;        ///< Raw isotropic diffuse radiation at TOA (only if !use_thermal_emission)
   double solar_flux = 0.0;          ///< Collimated solar flux at TOA
   double solar_mu = 1.0;            ///< cos(solar zenith angle), must be > 0
@@ -138,6 +139,11 @@ public:
           throw std::invalid_argument("ADConfig: temperature[" + std::to_string(l) + "] < 0");
       if (wavenumber_low < 0.0 || wavenumber_high < wavenumber_low)
         throw std::invalid_argument("ADConfig: invalid wavenumber range");
+    }
+    else if (surface_temperature >= 0.0)
+    {
+      throw std::invalid_argument("ADConfig: surface_temperature requires use_thermal_emission "
+                                  "(use surface_emission for raw thermal sources)");
     }
 
     if (use_diffusion_lower_bc) 

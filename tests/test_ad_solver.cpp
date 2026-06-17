@@ -931,6 +931,57 @@ TEST(ADSolver, ThermalPureAbsorption) {
   EXPECT_GT(r.flux_up[3], r.flux_up[0]);
 }
 
+TEST(ADSolver, ThermalSurfaceTemperature) {
+  // Surface (skin) temperature decoupled from the bottom level temperature.
+  // Build a thermally emitting, purely absorbing atmosphere with a black surface.
+  auto make = [](double surface_T) {
+    adrt::ADConfig cfg(3, 8);
+    cfg.use_thermal_emission = true;
+    cfg.wavenumber_low = 500.0;
+    cfg.wavenumber_high = 600.0;
+    cfg.surface_albedo = 0.0;       // black -> emissivity 1
+    cfg.surface_temperature = surface_T;
+    cfg.allocate();
+    std::vector<double> T = {200.0, 230.0, 260.0, 290.0};
+    for (int l = 0; l < 3; ++l) {
+      cfg.delta_tau[l] = 0.5;
+      cfg.single_scat_albedo[l] = 0.0;
+      cfg.temperature[l] = T[l];
+    }
+    cfg.temperature[3] = T[3];      // bottom level temperature = 290 K
+    cfg.setIsotropic();
+    return cfg;
+  };
+
+  // Sentinel (< 0): must reproduce emission at the bottom level temperature.
+  auto r_default = adrt::solve(make(-1.0));
+  auto r_match   = adrt::solve(make(290.0));  // explicit = bottom level T
+  EXPECT_NEAR(r_match.flux_up[3], r_default.flux_up[3], 1e-9);
+  EXPECT_NEAR(r_match.flux_up[0], r_default.flux_up[0], 1e-9);
+
+  // A hotter surface emits more -> larger upward flux everywhere.
+  auto r_hot = adrt::solve(make(330.0));
+  EXPECT_GT(r_hot.flux_up[3], r_default.flux_up[3]);
+  EXPECT_GT(r_hot.flux_up[0], r_default.flux_up[0]);
+
+  // The surface emission alone should equal pi*B(T_surface) at the surface
+  // for a black, non-scattering, optically negligible check: a colder surface
+  // than the air produces less upward flux at the surface.
+  auto r_cold = adrt::solve(make(250.0));
+  EXPECT_LT(r_cold.flux_up[3], r_default.flux_up[3]);
+}
+
+TEST(ADConfig, SurfaceTemperatureRequiresThermalEmission) {
+  adrt::ADConfig cfg(1, 8);
+  cfg.use_thermal_emission = false;
+  cfg.surface_temperature = 300.0;
+  cfg.allocate();
+  cfg.delta_tau[0] = 1.0;
+  cfg.single_scat_albedo[0] = 0.0;
+  cfg.setIsotropic();
+  EXPECT_THROW(cfg.validate(), std::invalid_argument);
+}
+
 TEST(ADSolver, ThermalScattering) {
   // Thermal + scattering: 4-layer isotropic, omega=1.0
   adrt::ADConfig cfg(4, 8);

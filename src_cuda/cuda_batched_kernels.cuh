@@ -551,8 +551,8 @@ __global__ void batchedAssembleSourceKernel(
 __global__ void batchedPureAbsorptionKernel(
     int nwav, int N,
     const float* __restrict__ tau,    // [nwav]
-    const float* __restrict__ B_top,  // [nwav]
-    const float* __restrict__ B_bot,  // [nwav]
+    const float* __restrict__ B_levels, // [nwav * nlev]
+    int nlev, int layer_idx,
     const float* __restrict__ mu,     // [N]
     float* __restrict__ T_ab,         // [nwav * N*N]
     float* __restrict__ T_ba,         // [nwav * N*N]
@@ -591,8 +591,10 @@ __global__ void batchedPureAbsorptionKernel(
     int w = idx / N;
     int i = idx % N;
     float t = tau[w];
-    float B_bar = (B_bot[w] + B_top[w]) * 0.5f;
-    float B_d_val = (t > 0.0f) ? (B_bot[w] - B_top[w]) / t : 0.0f;
+    float B_top = B_levels[w * nlev + layer_idx];
+    float B_bot = B_levels[w * nlev + layer_idx + 1];
+    float B_bar = (B_bot + B_top) * 0.5f;
+    float B_d_val = (t > 0.0f) ? (B_bot - B_top) / t : 0.0f;
     float tex = -t / mu[i];
     float trans = (tex > -87.0f) ? expf(tex) : 0.0f;
     float one_minus_t = 1.0f - trans;
@@ -652,6 +654,8 @@ __global__ void batchedSurfaceLayerKernel(
     float solar_flux, float solar_mu,
     bool has_solar,
     bool use_thermal_emission,
+    float surface_temperature,        // < 0: use bottom level temperature
+    double wavenumber_low, double wavenumber_high,
     const float* __restrict__ mu,   // [N]
     const float* __restrict__ wt,   // [N]
     float xfac,
@@ -690,7 +694,10 @@ __global__ void batchedSurfaceLayerKernel(
     int w = idx / N;
     int i = idx % N;
     float B_surf;
-    if (use_thermal_emission && B_levels != nullptr)
+    if (use_thermal_emission && surface_temperature >= 0.0f)
+      B_surf = planck_function(wavenumber_low, wavenumber_high,
+                               static_cast<double>(surface_temperature));
+    else if (use_thermal_emission && B_levels != nullptr)
       B_surf = B_levels[w * nlev + (nlev - 1)];
     else if (per_wav_surface_emission != nullptr)
       B_surf = per_wav_surface_emission[w];
@@ -925,6 +932,8 @@ __global__ void batchedBoundaryIntensityKernel(
     int nlev,
     float top_emission_scalar,
     float surface_emission_scalar,
+    float surface_temperature,        // < 0: use bottom level temperature
+    double wavenumber_low, double wavenumber_high,
     bool use_thermal_emission,
     bool use_diffusion_lower_bc,
     bool has_surface,
@@ -962,7 +971,10 @@ __global__ void batchedBoundaryIntensityKernel(
     I_bot_up[idx] = B_bottom + mu[i] * dB_dtau;
   } else if (!has_surface) {
     float B_surf;
-    if (use_thermal_emission) {
+    if (use_thermal_emission && surface_temperature >= 0.0f) {
+      B_surf = planck_function(wavenumber_low, wavenumber_high,
+                               static_cast<double>(surface_temperature));
+    } else if (use_thermal_emission) {
       B_surf = B_levels[w * nlev + nlay];
     } else if (per_wav_surface_emission != nullptr) {
       B_surf = per_wav_surface_emission[w];

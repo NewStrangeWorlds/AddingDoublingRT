@@ -139,6 +139,7 @@ static CUDAResult cudaSolveSingle(const adrt::ADConfig& config)
   bcfg.use_diffusion_lower_bc = config.use_diffusion_lower_bc;
   bcfg.surface_albedo = config.surface_albedo;
   bcfg.surface_emission = config.surface_emission;
+  bcfg.surface_temperature = config.surface_temperature;
   bcfg.top_emission = config.top_emission;
   bcfg.solar_flux = config.solar_flux;
   bcfg.solar_mu = config.solar_mu;
@@ -738,6 +739,50 @@ void test_thermal_scattering() {
   CHECK_NEAR("flux_up", cuda.flux_up, cpu.flux_up[0], 0.5);
   CHECK_TRUE("not_nan_up", !std::isnan(cuda.flux_up));
   CHECK_TRUE("not_nan_down", !std::isnan(cuda.flux_down));
+  std::cout << "done\n";
+}
+
+
+void test_thermal_surface_temperature() {
+  std::cout << "  test_thermal_surface_temperature ... ";
+
+  // Decoupled surface (skin) temperature, CPU vs CUDA.
+  // nq=8 exercises the single-thread solveKernel; nq=16 the cuBLAS batched path.
+  // Uses pure absorption + black surface: this is the regression guard for the
+  // batched-path blow-up that occurred when a layer was non-scattering for all
+  // wavenumbers (the doubling iteration is unstable there; the analytic
+  // pure-absorption branch must be used instead).
+  for (int nq : {8, 16}) {
+    adrt::ADConfig cfg(3, nq);
+    cfg.use_thermal_emission = true;
+    cfg.wavenumber_low = 500.0;
+    cfg.wavenumber_high = 600.0;
+    cfg.surface_albedo = 0.0;          // black surface
+    cfg.surface_temperature = 330.0;   // hotter than bottom level (290 K)
+    cfg.allocate();
+
+    std::vector<double> T = {200.0, 230.0, 260.0, 290.0};
+    for (int l = 0; l < 3; ++l) {
+      cfg.delta_tau[l] = 0.5;
+      cfg.single_scat_albedo[l] = 0.0;
+      cfg.temperature[l] = T[l];
+    }
+    cfg.temperature[3] = T[3];
+    cfg.setIsotropic();
+
+    auto cpu = cpuSolve(cfg);
+    auto cuda = cudaSolveSingle(cfg);
+
+    double tol = 0.01 * std::abs(cpu.flux_up[0]) + 0.1;
+    CHECK_NEAR("surfT_flux_up", cuda.flux_up, cpu.flux_up[0], tol);
+    CHECK_TRUE("surfT_not_nan", !std::isnan(cuda.flux_up));
+
+    // A hotter black surface must emit more than the sentinel (bottom level T).
+    adrt::ADConfig cfg_def = cfg;
+    cfg_def.surface_temperature = -1.0;
+    auto cuda_def = cudaSolveSingle(cfg_def);
+    CHECK_TRUE("surfT_hotter_emits_more", cuda.flux_up > cuda_def.flux_up);
+  }
   std::cout << "done\n";
 }
 
@@ -1840,6 +1885,7 @@ int main() {
   test_thermal_7c();
   test_thermal_pure_absorption();
   test_thermal_scattering();
+  test_thermal_surface_temperature();
   test_thermal_hg_deltam();
 
   // Linear source (analytical)
