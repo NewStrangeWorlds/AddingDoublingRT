@@ -64,13 +64,18 @@ struct DynLayerMatrices {
   std::vector<double> s_up_solar;
   std::vector<double> s_down_solar;
 
+  /// Thermal source-derivative basis (see LayerMatrices<N>::j_p/j_q).
+  std::vector<double> j_p;
+  std::vector<double> j_q;
+
   bool is_scattering = false;
 
   explicit DynLayerMatrices(int n)
     : R_ab(n), R_ba(n),
       T_ab(DynamicMatrix::identity(n)), T_ba(DynamicMatrix::identity(n)),
       s_up(n, 0.0), s_down(n, 0.0),
-      s_up_solar(n, 0.0), s_down_solar(n, 0.0) {}
+      s_up_solar(n, 0.0), s_down_solar(n, 0.0),
+      j_p(n, 0.0), j_q(n, 0.0) {}
 };
 
 } // namespace adrt

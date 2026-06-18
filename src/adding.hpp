@@ -9,6 +9,22 @@
 namespace adrt {
 
 // ============================================================================
+//  Adding-operator cache (for analytic temperature Jacobians)
+// ============================================================================
+//
+// Captures the LU factorisations of the two coupling matrices formed during a
+// general (scattering+scattering) adding step, so the linearised source sweep
+// can reuse them instead of recomputing. For non-scattering steps both matrices
+// reduce to the identity (general == false) and no factorisation is stored.
+template<int N>
+struct AddStepOps {
+  using EMat = typename Matrix<N>::EigenMat;
+  bool general = false;
+  Eigen::PartialPivLU<EMat> lu1;  ///< of A1 = E - bot.R_ab * top.R_ba
+  Eigen::PartialPivLU<EMat> lu2;  ///< of A2 = E - top.R_ba * bot.R_ab
+};
+
+// ============================================================================
 //  Source combination helper
 // ============================================================================
 
@@ -53,8 +69,10 @@ void addSources(
 template<int N>
 LayerMatrices<N> addLayersGeneral(
     const LayerMatrices<N>& top,
-    const LayerMatrices<N>& bot)
+    const LayerMatrices<N>& bot,
+    AddStepOps<N>* ops = nullptr)
 {
+  using EMat = typename Matrix<N>::EigenMat;
   LayerMatrices<N> ans;
   ans.is_scattering = true;
 
@@ -63,8 +81,20 @@ LayerMatrices<N> addLayersGeneral(
   Matrix<N> A1 = I.add(bot.R_ab.multiply(top.R_ba), -1.0);
   Matrix<N> A2 = I.add(top.R_ba.multiply(bot.R_ab), -1.0);
 
-  Matrix<N> T_ba_D1 = A1.rightSolveMatrix(top.T_ba);
-  Matrix<N> T_bc_D2 = A2.rightSolveMatrix(bot.T_ab);
+  Matrix<N> T_ba_D1, T_bc_D2;
+
+  if (ops) {
+    // Cache the (left) LU factorisations and derive the forward operators from
+    // them, so the Jacobian sweep can reuse the exact same factorisations.
+    ops->general = true;
+    ops->lu1.compute(A1.eigen());
+    ops->lu2.compute(A2.eigen());
+    T_ba_D1 = Matrix<N>(EMat(top.T_ba.eigen() * ops->lu1.solve(EMat::Identity())));
+    T_bc_D2 = Matrix<N>(EMat(bot.T_ab.eigen() * ops->lu2.solve(EMat::Identity())));
+  } else {
+    T_ba_D1 = A1.rightSolveMatrix(top.T_ba);
+    T_bc_D2 = A2.rightSolveMatrix(bot.T_ab);
+  }
 
   Matrix<N> temp1 = T_ba_D1.multiply(bot.R_ab);
   ans.R_ab = top.R_ab.add(temp1.multiply(top.T_ab));
@@ -87,11 +117,14 @@ LayerMatrices<N> addLayersGeneral(
 template<int N>
 LayerMatrices<N> addLayersNonscatTop(
     const LayerMatrices<N>& top,
-    const LayerMatrices<N>& bot)
+    const LayerMatrices<N>& bot,
+    AddStepOps<N>* ops = nullptr)
 {
   using Vec = typename Matrix<N>::EigenVec;
   LayerMatrices<N> ans;
   ans.is_scattering = bot.is_scattering;
+
+  if (ops) ops->general = false;   // top non-scattering => A1 = A2 = E
 
   Vec t;
 
@@ -148,14 +181,17 @@ LayerMatrices<N> addLayersNonscatTop(
 template<int N>
 LayerMatrices<N> addLayersNonscatBot(
     const LayerMatrices<N>& top,
-    const LayerMatrices<N>& bot)
+    const LayerMatrices<N>& bot,
+    AddStepOps<N>* ops = nullptr)
 {
   using Vec = typename Matrix<N>::EigenVec;
   LayerMatrices<N> ans;
   ans.is_scattering = top.is_scattering;
 
+  if (ops) ops->general = false;   // bot non-scattering => A1 = A2 = E
+
   Vec t;
-  
+
   for (int i = 0; i < N; ++i)
     t[i] = bot.T_ab(i, i);
 
@@ -210,14 +246,15 @@ LayerMatrices<N> addLayersNonscatBot(
 template<int N>
 LayerMatrices<N> addLayers(
     const LayerMatrices<N>& top,
-    const LayerMatrices<N>& bot)
+    const LayerMatrices<N>& bot,
+    AddStepOps<N>* ops = nullptr)
 {
   if (!top.is_scattering)
-    return addLayersNonscatTop<N>(top, bot);
+    return addLayersNonscatTop<N>(top, bot, ops);
   if (!bot.is_scattering)
-    return addLayersNonscatBot<N>(top, bot);
-  
-  return addLayersGeneral<N>(top, bot);
+    return addLayersNonscatBot<N>(top, bot, ops);
+
+  return addLayersGeneral<N>(top, bot, ops);
 }
 
 } // namespace adrt

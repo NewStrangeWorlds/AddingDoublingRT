@@ -188,3 +188,37 @@ TEST(TemperatureJacobian, QuadratureOrders) {
     runCase(cfg);
   }
 }
+
+// Off-list quadrature counts (6, 12) take the runtime-sized solveDynamic path.
+TEST(TemperatureJacobian, DynamicPathScattering) {
+  for (int nquad : {6, 12}) {
+    ADConfig cfg = baseThermal(5, nquad);
+    for (int l = 0; l < cfg.num_layers; ++l) {
+      cfg.single_scat_albedo[l] = 0.6;
+      cfg.setHenyeyGreenstein(0.5, l);
+    }
+    cfg.surface_albedo = 0.3;
+    cfg.surface_temperature = 250.0;
+    runCase(cfg);
+  }
+}
+
+TEST(TemperatureJacobian, DynamicPathAbsorptionAndDiffusionBC) {
+  // Absorption + folded surface on the dynamic path.
+  {
+    ADConfig cfg = baseThermal(4, 6);
+    for (int l = 0; l < cfg.num_layers; ++l) cfg.single_scat_albedo[l] = 0.0;
+    cfg.surface_albedo = 0.0;
+    runCase(cfg);
+  }
+  // High scattering + diffusion lower BC on the dynamic path.
+  {
+    ADConfig cfg = baseThermal(5, 6);
+    for (int l = 0; l < cfg.num_layers; ++l) {
+      cfg.single_scat_albedo[l] = 0.9;
+      cfg.setHenyeyGreenstein(0.7, l);
+    }
+    cfg.use_diffusion_lower_bc = true;
+    runCase(cfg);
+  }
+}

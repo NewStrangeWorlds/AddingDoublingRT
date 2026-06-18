@@ -26,7 +26,8 @@ static typename Matrix<N>::EigenVec computeIup(
   const LayerMatrices<N>& top,
   const LayerMatrices<N>& base,
   const typename Matrix<N>::EigenVec& I_top_down,
-  const typename Matrix<N>::EigenVec& I_bot_up)
+  const typename Matrix<N>::EigenVec& I_bot_up,
+  Eigen::PartialPivLU<typename Matrix<N>::EigenMat>* lu_out = nullptr)
 {
   using Vec = typename Matrix<N>::EigenVec;
 
@@ -41,6 +42,7 @@ static typename Matrix<N>::EigenVec computeIup(
 
   Vec rhs = term1 + term2 + term3 + base.s_up + base.s_up_solar;
 
+  if (lu_out) { lu_out->compute(to_invert.eigen()); return lu_out->solve(rhs); }
   return to_invert.solve(rhs);
 }
 
@@ -50,7 +52,8 @@ static typename Matrix<N>::EigenVec computeIdown(
   const LayerMatrices<N>& top,
   const LayerMatrices<N>& base,
   const typename Matrix<N>::EigenVec& I_top_down,
-  const typename Matrix<N>::EigenVec& I_bot_up)
+  const typename Matrix<N>::EigenVec& I_bot_up,
+  Eigen::PartialPivLU<typename Matrix<N>::EigenMat>* lu_out = nullptr)
 {
   using Vec = typename Matrix<N>::EigenVec;
 
@@ -65,8 +68,36 @@ static typename Matrix<N>::EigenVec computeIdown(
 
   Vec rhs = term1 + term2 + term3 + top.s_down + top.s_down_solar;
 
+  if (lu_out) { lu_out->compute(to_invert.eigen()); return lu_out->solve(rhs); }
   return to_invert.solve(rhs);
 }
+
+
+// ============================================================================
+//  Forward-pass operator cache for the temperature Jacobian
+// ============================================================================
+//
+// The forward composite build and interface evaluation factorise exactly the
+// coupling matrices the Jacobian needs. When a temperature Jacobian is
+// requested these factorisations are captured here and reused, so the linearised
+// sweeps and interface differentiation perform no redundant LU work.
+template<int N>
+struct JacCache {
+  using EMat = typename Matrix<N>::EigenMat;
+  std::vector<AddStepOps<N>> rbase_ops;  ///< step l produces rbase[l+1], l=1..ltot-1
+  std::vector<AddStepOps<N>> rtop_ops;   ///< step l produces rtop[l+1],  l=1..ltot-1
+  std::vector<Eigen::PartialPivLU<EMat>> iface_up_lu;  ///< interface l=1..nlay (computeIup)
+  std::vector<Eigen::PartialPivLU<EMat>> iface_dn_lu;  ///< interface l=1..nlay (computeIdown)
+  std::vector<char> iface_has;            ///< 1 if interface l used the n_base>0 solve
+
+  void allocate(int ltot, int nlay) {
+    rbase_ops.assign(ltot, AddStepOps<N>());
+    rtop_ops.assign(ltot, AddStepOps<N>());
+    iface_up_lu.assign(nlay + 1, Eigen::PartialPivLU<EMat>());
+    iface_dn_lu.assign(nlay + 1, Eigen::PartialPivLU<EMat>());
+    iface_has.assign(nlay + 1, 0);
+  }
+};
 
 
 // ============================================================================
@@ -76,9 +107,9 @@ static typename Matrix<N>::EigenVec computeIdown(
 // Temperature enters only through the Planck source, so every R/T matrix and
 // every adding operator is temperature-independent. We seed the per-layer source
 // derivatives (LayerMatrices::j_p, j_q and the surface (1-A) term), propagate
-// them through the SAME adding recursion as the forward pass (reusing the stored
-// composite R/T to rebuild the cheap (E - R R)^{-1} operators), then differentiate
-// the interface-output formulas. Finally a per-column Planck chain rule converts
+// them through the SAME adding recursion as the forward pass (reusing the LU
+// factorisations cached during that pass), then differentiate the
+// interface-output formulas. Finally a per-column Planck chain rule converts
 // the B-Jacobians to temperature Jacobians.
 //
 // DOF layout (columns): 0..nlay = level temperatures, nlay+1 = surface skin
@@ -93,6 +124,7 @@ static void computeTemperatureJacobian(
     const std::vector<LayerMatrices<N>>& layer_rtj,
     const std::vector<LayerMatrices<N>>& rbase,
     const std::vector<LayerMatrices<N>>& rtop,
+    const JacCache<N>& cache,
     RTOutput& result)
 {
   using EMat = Eigen::Matrix<double, N, N>;
@@ -111,8 +143,6 @@ static void computeTemperatureJacobian(
       has_surface && (thermal ? (cfg.surface_temperature >= 0.0)
                               : (static_cast<int>(cfg.planck_levels.size()) == nlay + 1));
   const int surf_col = surface_independent ? surf_dof : nlay;
-
-  const EMat Id = EMat::Identity();
 
   // --- Per-layer source-derivative seeds ------------------------------------
   // Atmospheric layer j (0..nlay-1) feeds columns j, j+1; the surface feeds
@@ -135,25 +165,27 @@ static void computeTemperatureJacobian(
   };
 
   // --- Linearised source combination (Eqs. adduplin/adddnlin) ---------------
-  // Mirrors addSources with derivative blocks as inputs, rebuilding the forward
-  // operators from the stored operand R/T.
+  // Mirrors addSources with derivative blocks as inputs, reusing the forward
+  // operator LU factorisations cached in `ops`. The forward operators are
+  // T_ba_D1 = top.T_ba * A1^{-1} and T_bc_D2 = bot.T_ab * A2^{-1}, so the inverse
+  // is applied first and T is left-multiplied afterwards. For non-scattering
+  // steps A1 = A2 = E (ops.general == false) and the solve is skipped.
   auto addSourcesLin = [&](const LayerMatrices<N>& top, const LayerMatrices<N>& bot,
+                           const AddStepOps<N>& ops,
                            const Block& dU_top, const Block& dD_top,
                            const Block& dU_bot, const Block& dD_bot,
                            Block& dU_ans, Block& dD_ans) {
     const EMat& Rab_bot = bot.R_ab.eigen();
     const EMat& Rba_top = top.R_ba.eigen();
-    EMat A1 = Id - Rab_bot * Rba_top;
-    EMat A2 = Id - Rba_top * Rab_bot;
-    auto lu1 = A1.partialPivLu();
-    auto lu2 = A2.partialPivLu();
-    // Forward operators are T_ba_D1 = top.T_ba * A1^{-1} and
-    // T_bc_D2 = bot.T_ab * A2^{-1} (addLayersGeneral uses rightSolveMatrix), so
-    // apply the inverse first, then multiply by T on the left.
     Block tmpU = dU_bot + Rab_bot * dD_top;
-    dU_ans = dU_top + top.T_ba.eigen() * lu1.solve(tmpU);
     Block tmpD = dD_top + Rba_top * dU_bot;
-    dD_ans = dD_bot + bot.T_ab.eigen() * lu2.solve(tmpD);
+    if (ops.general) {
+      dU_ans = dU_top + top.T_ba.eigen() * ops.lu1.solve(tmpU);
+      dD_ans = dD_bot + bot.T_ab.eigen() * ops.lu2.solve(tmpD);
+    } else {
+      dU_ans = dU_top + top.T_ba.eigen() * tmpU;   // A1 = E
+      dD_ans = dD_bot + bot.T_ab.eigen() * tmpD;   // A2 = E
+    }
   };
 
   const Block zero_block = Block::Zero(N, ndof);
@@ -165,8 +197,8 @@ static void computeTemperatureJacobian(
     int k = ltot - 1 - l;
     Block su(N, ndof), sd(N, ndof);
     seedLayer(k, su, sd);
-    addSourcesLin(layer_rtj[k], rbase[l], su, sd, dRbase_up[l], dRbase_dn[l],
-                  dRbase_up[l + 1], dRbase_dn[l + 1]);
+    addSourcesLin(layer_rtj[k], rbase[l], cache.rbase_ops[l], su, sd,
+                  dRbase_up[l], dRbase_dn[l], dRbase_up[l + 1], dRbase_dn[l + 1]);
   }
 
   // --- Top-down sweep: dS for every rtop[l] ---------------------------------
@@ -175,8 +207,8 @@ static void computeTemperatureJacobian(
   for (int l = 1; l < ltot; ++l) {
     Block su(N, ndof), sd(N, ndof);
     seedLayer(l, su, sd);
-    addSourcesLin(rtop[l], layer_rtj[l], dRtop_up[l], dRtop_dn[l], su, sd,
-                  dRtop_up[l + 1], dRtop_dn[l + 1]);
+    addSourcesLin(rtop[l], layer_rtj[l], cache.rtop_ops[l], dRtop_up[l], dRtop_dn[l],
+                  su, sd, dRtop_up[l + 1], dRtop_dn[l + 1]);
   }
 
   // --- Boundary-intensity derivatives ---------------------------------------
@@ -238,19 +270,17 @@ static void computeTemperatureJacobian(
     if (n_base > 0) {
       const auto& top  = rtop[n_top];
       const auto& base = rbase[n_base];
-      EMat Au = Id - base.R_ab.eigen() * top.R_ba.eigen();
       Block rhs_u = base.T_ba.eigen() * dIbot_up
                   + base.R_ab.eigen() * (top.T_ab.eigen() * dItop_dn)
                   + base.R_ab.eigen() * dRtop_dn[n_top]
                   + dRbase_up[n_base];
-      dIup = Au.partialPivLu().solve(rhs_u);
+      dIup = cache.iface_up_lu[l].solve(rhs_u);   // cached LU of (E - base.R_ab top.R_ba)
 
-      EMat Ad = Id - top.R_ba.eigen() * base.R_ab.eigen();
       Block rhs_d = top.T_ab.eigen() * dItop_dn
                   + top.R_ba.eigen() * (base.T_ba.eigen() * dIbot_up)
                   + top.R_ba.eigen() * dRbase_up[n_base]
                   + dRtop_dn[n_top];
-      dIdn = Ad.partialPivLu().solve(rhs_d);
+      dIdn = cache.iface_dn_lu[l].solve(rhs_d);   // cached LU of (E - top.R_ba base.R_ab)
     } else {
       const auto& top = rtop[n_top];
       dIdn = top.T_ab.eigen() * dItop_dn + top.R_ba.eigen() * dIbot_up
@@ -510,6 +540,13 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
     ltot++;
   }
 
+  // Capture the forward operator factorisations only when a Jacobian is wanted.
+  bool want_jac = cfg.compute_temperature_jacobian &&
+                  (cfg.use_thermal_emission ||
+                   static_cast<int>(cfg.planck_levels.size()) == nlay + 1);
+  JacCache<N> jcache;
+  if (want_jac) jcache.allocate(ltot, nlay);
+
   // --- 5. Build composites from bottom (RBASE) ---
   std::vector<LayerMatrices<N>> rbase;
   rbase.reserve(ltot + 1);
@@ -517,10 +554,11 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
 
   rbase.push_back(layer_rtj[ltot - 1]);
 
-  for (int l = 1; l < ltot; ++l) 
+  for (int l = 1; l < ltot; ++l)
   {
     int k = ltot - 1 - l;
-    rbase.push_back(addLayers<N>(layer_rtj[k], rbase[l]));
+    rbase.push_back(addLayers<N>(layer_rtj[k], rbase[l],
+                                 want_jac ? &jcache.rbase_ops[l] : nullptr));
   }
 
   // --- 6. Build composites from top (RTOP) ---
@@ -531,7 +569,8 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
   rtop.push_back(layer_rtj[0]);
 
   for (int l = 1; l < ltot; ++l)
-    rtop.push_back(addLayers<N>(rtop[l], layer_rtj[l]));
+    rtop.push_back(addLayers<N>(rtop[l], layer_rtj[l],
+                                want_jac ? &jcache.rtop_ops[l] : nullptr));
 
   // --- 7. Boundary intensities ---
   Vec I_top_down;
@@ -599,12 +638,15 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
 
     Vec Iup, Idown;
 
-    if (n_base > 0 && n_top > 0) 
+    if (n_base > 0 && n_top > 0)
     {
-      Iup   = computeIup<N>(rtop[n_top], rbase[n_base], I_top_down, I_bot_up);
-      Idown = computeIdown<N>(rtop[n_top], rbase[n_base], I_top_down, I_bot_up);
+      Iup   = computeIup<N>(rtop[n_top], rbase[n_base], I_top_down, I_bot_up,
+                            want_jac ? &jcache.iface_up_lu[l] : nullptr);
+      Idown = computeIdown<N>(rtop[n_top], rbase[n_base], I_top_down, I_bot_up,
+                              want_jac ? &jcache.iface_dn_lu[l] : nullptr);
+      if (want_jac) jcache.iface_has[l] = 1;
     }
-    else if (n_base == 0) 
+    else if (n_base == 0)
     {
       Idown = rtop[n_top].T_ab.multiply(I_top_down);
       Vec RtopIbot = rtop[n_top].R_ba.multiply(I_bot_up);
@@ -650,12 +692,10 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
   // --- 9. Analytic temperature Jacobians (optional) ---
   // Done before the index_from_bottom reversal; the routine handles its own
   // axis reversal for the Jacobian arrays.
-  if (cfg.compute_temperature_jacobian &&
-      (cfg.use_thermal_emission ||
-       static_cast<int>(cfg.planck_levels.size()) == nlay + 1))
+  if (want_jac)
   {
     computeTemperatureJacobian<N>(cfg, nlay, ltot, has_surface, mu, wt,
-                                  tau_used, layer_rtj, rbase, rtop, result);
+                                  tau_used, layer_rtj, rbase, rtop, jcache, result);
   }
 
   // Reverse output if indexed from bottom
@@ -896,9 +936,11 @@ static DynLayerMatrices dynDoubling(
       
       double one_minus_t = 1.0 - trans;
       double slope_term = mu[i] * one_minus_t - 0.5 * tau * (1.0 + trans);
-      
+
       layer.s_up[i]   = B_bar * one_minus_t + B_d * slope_term;
       layer.s_down[i] = B_bar * one_minus_t - B_d * slope_term;
+      layer.j_p[i] = 0.5 * one_minus_t - slope_term / tau;
+      layer.j_q[i] = 0.5 * one_minus_t + slope_term / tau;
     }
 
     return layer;
@@ -1041,9 +1083,215 @@ static DynLayerMatrices dynDoubling(
     result.s_down[i] = y_k[i] * B_bar - z_k[i] * B_d;
     result.s_up_solar[i]   = s_up_sol_k[i];
     result.s_down_solar[i] = s_down_sol_k[i];
+    result.j_p[i] = 0.5 * y_k[i] - z_k[i] / tau;
+    result.j_q[i] = 0.5 * y_k[i] + z_k[i] / tau;
   }
 
   return result;
+}
+
+
+// ============================================================================
+//  Analytic temperature Jacobian -- dynamic (runtime-sized) fallback
+// ============================================================================
+//
+// Same linearisation as computeTemperatureJacobian<N>, transcribed for the
+// runtime-sized path (DynamicMatrix / Eigen::MatrixXd). Used only for off-list
+// quadrature counts, so the cheap adding operators are recomputed here rather
+// than cached (the templated hot path caches them).
+static void computeTemperatureJacobianDynamic(
+    const ADConfig& cfg,
+    int nlay, int ltot, bool has_surface, int nmu,
+    const std::vector<double>& mu,
+    const std::vector<double>& wt,
+    const std::vector<double>& tau_used,
+    const std::vector<DynLayerMatrices>& layer_rtj,
+    const std::vector<DynLayerMatrices>& rbase,
+    const std::vector<DynLayerMatrices>& rtop,
+    RTOutput& result)
+{
+  using Mat = Eigen::MatrixXd;
+
+  const bool thermal = cfg.use_thermal_emission;
+  const int n_interfaces = nlay + 1;
+  const int ndof = nlay + 2;
+  const int surf_dof = nlay + 1;
+  const double A = cfg.surface_albedo;
+
+  const bool surface_independent =
+      has_surface && (thermal ? (cfg.surface_temperature >= 0.0)
+                              : (static_cast<int>(cfg.planck_levels.size()) == nlay + 1));
+  const int surf_col = surface_independent ? surf_dof : nlay;
+  const Mat IdN = Mat::Identity(nmu, nmu);
+
+  auto seedLayer = [&](int j, Mat& dU, Mat& dD) {
+    dU.setZero();
+    dD.setZero();
+    if (has_surface && j == nlay) {
+      for (int i = 0; i < nmu; ++i) dU(i, surf_col) = (1.0 - A);
+      return;
+    }
+    const auto& L = layer_rtj[j];
+    for (int i = 0; i < nmu; ++i) {
+      dU(i, j)     += L.j_p[i];
+      dU(i, j + 1) += L.j_q[i];
+      dD(i, j)     += L.j_q[i];
+      dD(i, j + 1) += L.j_p[i];
+    }
+  };
+
+  auto addSourcesLin = [&](const DynLayerMatrices& top, const DynLayerMatrices& bot,
+                           const Mat& dU_top, const Mat& dD_top,
+                           const Mat& dU_bot, const Mat& dD_bot,
+                           Mat& dU_ans, Mat& dD_ans) {
+    const Mat& Rab_bot = bot.R_ab.eigen();
+    const Mat& Rba_top = top.R_ba.eigen();
+    Mat A1 = IdN - Rab_bot * Rba_top;
+    Mat A2 = IdN - Rba_top * Rab_bot;
+    Mat tmpU = dU_bot + Rab_bot * dD_top;
+    Mat tmpD = dD_top + Rba_top * dU_bot;
+    dU_ans = dU_top + top.T_ba.eigen() * A1.partialPivLu().solve(tmpU);
+    dD_ans = dD_bot + bot.T_ab.eigen() * A2.partialPivLu().solve(tmpD);
+  };
+
+  const Mat zero_block = Mat::Zero(nmu, ndof);
+
+  std::vector<Mat> dRbase_up(ltot + 1, zero_block), dRbase_dn(ltot + 1, zero_block);
+  seedLayer(ltot - 1, dRbase_up[1], dRbase_dn[1]);
+  for (int l = 1; l < ltot; ++l) {
+    int k = ltot - 1 - l;
+    Mat su(nmu, ndof), sd(nmu, ndof);
+    seedLayer(k, su, sd);
+    addSourcesLin(layer_rtj[k], rbase[l], su, sd, dRbase_up[l], dRbase_dn[l],
+                  dRbase_up[l + 1], dRbase_dn[l + 1]);
+  }
+
+  std::vector<Mat> dRtop_up(ltot + 1, zero_block), dRtop_dn(ltot + 1, zero_block);
+  seedLayer(0, dRtop_up[1], dRtop_dn[1]);
+  for (int l = 1; l < ltot; ++l) {
+    Mat su(nmu, ndof), sd(nmu, ndof);
+    seedLayer(l, su, sd);
+    addSourcesLin(rtop[l], layer_rtj[l], dRtop_up[l], dRtop_dn[l], su, sd,
+                  dRtop_up[l + 1], dRtop_dn[l + 1]);
+  }
+
+  Mat dItop_dn = Mat::Zero(nmu, ndof);
+  if (thermal)
+    for (int i = 0; i < nmu; ++i) dItop_dn(i, 0) = 1.0;
+
+  Mat dIbot_up = Mat::Zero(nmu, ndof);
+  if (!has_surface && cfg.use_diffusion_lower_bc) {
+    double dtau_last = tau_used[nlay - 1];
+    if (dtau_last > 0.0) {
+      for (int i = 0; i < nmu; ++i) {
+        dIbot_up(i, nlay)     = 1.0 + mu[i] / dtau_last;
+        dIbot_up(i, nlay - 1) = -mu[i] / dtau_last;
+      }
+    } else {
+      for (int i = 0; i < nmu; ++i) dIbot_up(i, nlay) = 1.0;
+    }
+  }
+
+  auto& Ju  = result.flux_up_temperature_jac;
+  auto& Jd  = result.flux_down_temperature_jac;
+  auto& Jm  = result.mean_intensity_temperature_jac;
+  auto& Jdv = result.flux_divergence_temperature_jac;
+  Ju.assign(n_interfaces, std::vector<double>(ndof, 0.0));
+  Jd.assign(n_interfaces, std::vector<double>(ndof, 0.0));
+  Jm.assign(n_interfaces, std::vector<double>(ndof, 0.0));
+  Jdv.assign(n_interfaces, std::vector<double>(ndof, 0.0));
+
+  auto reduce = [&](int k, const Mat& dIup, const Mat& dIdn) {
+    for (int m = 0; m < ndof; ++m) {
+      double fu = 0.0, fd = 0.0, jm = 0.0;
+      for (int i = 0; i < nmu; ++i) {
+        fu += 2.0 * PI * wt[i] * mu[i] * dIup(i, m);
+        fd += 2.0 * PI * wt[i] * mu[i] * dIdn(i, m);
+        jm += 0.5 * wt[i] * (dIup(i, m) + dIdn(i, m));
+      }
+      Ju[k][m] = fu;
+      Jd[k][m] = fd;
+      Jm[k][m] = jm;
+    }
+  };
+
+  {
+    const auto& full = rbase[ltot];
+    Mat dIup = full.R_ab.eigen() * dItop_dn + full.T_ba.eigen() * dIbot_up
+               + dRbase_up[ltot];
+    reduce(0, dIup, dItop_dn);
+  }
+
+  for (int l = 1; l <= nlay; ++l) {
+    int n_top = l;
+    int n_base = ltot - l;
+    Mat dIup, dIdn;
+    if (n_base > 0) {
+      const auto& top  = rtop[n_top];
+      const auto& base = rbase[n_base];
+      Mat Au = IdN - base.R_ab.eigen() * top.R_ba.eigen();
+      Mat rhs_u = base.T_ba.eigen() * dIbot_up
+                + base.R_ab.eigen() * (top.T_ab.eigen() * dItop_dn)
+                + base.R_ab.eigen() * dRtop_dn[n_top]
+                + dRbase_up[n_base];
+      dIup = Au.partialPivLu().solve(rhs_u);
+
+      Mat Ad = IdN - top.R_ba.eigen() * base.R_ab.eigen();
+      Mat rhs_d = top.T_ab.eigen() * dItop_dn
+                + top.R_ba.eigen() * (base.T_ba.eigen() * dIbot_up)
+                + top.R_ba.eigen() * dRbase_up[n_base]
+                + dRtop_dn[n_top];
+      dIdn = Ad.partialPivLu().solve(rhs_d);
+    } else {
+      const auto& top = rtop[n_top];
+      dIdn = top.T_ab.eigen() * dItop_dn + top.R_ba.eigen() * dIbot_up
+             + dRtop_dn[n_top];
+      dIup = dIbot_up;
+    }
+    reduce(l, dIup, dIdn);
+  }
+
+  for (int k = 0; k < n_interfaces; ++k) {
+    int lyr = (k == 0) ? 0 : k - 1;
+    double pref = 4.0 * PI * (1.0 - cfg.single_scat_albedo[lyr]);
+    for (int m = 0; m < ndof; ++m) {
+      double dB_term = (m == k) ? 1.0 : 0.0;
+      Jdv[k][m] = pref * (Jm[k][m] - dB_term);
+    }
+  }
+
+  std::vector<double> chain(ndof, 1.0);
+  if (thermal) {
+    for (int m = 0; m <= nlay; ++m)
+      chain[m] = planckFunctionDeriv(cfg.wavenumber_low, cfg.wavenumber_high,
+                                     cfg.temperature[m]);
+    chain[surf_dof] = surface_independent
+        ? planckFunctionDeriv(cfg.wavenumber_low, cfg.wavenumber_high,
+                              cfg.surface_temperature)
+        : 0.0;
+  } else if (!surface_independent) {
+    chain[surf_dof] = 0.0;
+  }
+
+  for (int k = 0; k < n_interfaces; ++k)
+    for (int m = 0; m < ndof; ++m) {
+      Ju[k][m]  *= chain[m];
+      Jd[k][m]  *= chain[m];
+      Jm[k][m]  *= chain[m];
+      Jdv[k][m] *= chain[m];
+    }
+
+  if (cfg.index_from_bottom) {
+    auto reverse_jac = [&](std::vector<std::vector<double>>& J) {
+      for (auto& row : J)
+        std::reverse(row.begin(), row.begin() + (nlay + 1));
+      std::reverse(J.begin(), J.end());
+    };
+    reverse_jac(Ju);
+    reverse_jac(Jd);
+    reverse_jac(Jm);
+    reverse_jac(Jdv);
+  }
 }
 
 
@@ -1052,7 +1300,7 @@ static DynLayerMatrices dynDoubling(
 // ============================================================================
 
 static RTOutput solveDynamic(
-  const ADConfig& config, 
+  const ADConfig& config,
   SolverWorkspace* ws) 
 {
   SolverWorkspace local_ws;
@@ -1392,6 +1640,16 @@ static RTOutput solveDynamic(
     int lyr = (l == 0) ? 0 : l - 1;
     result.flux_divergence[l] = 4.0 * PI * (1.0 - cfg.single_scat_albedo[lyr])
                                 * (result.mean_intensity[l] - B[l]);
+  }
+
+  // Analytic temperature Jacobians (optional), before the index_from_bottom
+  // reversal; the routine handles its own axis reversal for the Jacobian arrays.
+  if (cfg.compute_temperature_jacobian &&
+      (cfg.use_thermal_emission ||
+       static_cast<int>(cfg.planck_levels.size()) == nlay + 1))
+  {
+    computeTemperatureJacobianDynamic(cfg, nlay, ltot, has_surface, nmu, mu, wt,
+                                      tau_used, layer_rtj, rbase, rtop, result);
   }
 
   if (cfg.index_from_bottom)
