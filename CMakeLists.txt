@@ -52,7 +52,7 @@ target_link_libraries(ad_example adding_doubling)
 
 # Test suite
 enable_testing()
-add_executable(ad_tests tests/main.cpp tests/test_ad_solver.cpp)
+add_executable(ad_tests tests/main.cpp tests/test_ad_solver.cpp tests/test_temperature_jacobian.cpp)
 target_link_libraries(ad_tests adding_doubling)
 target_include_directories(ad_tests PRIVATE tests)
 add_test(NAME ad_tests COMMAND ad_tests)

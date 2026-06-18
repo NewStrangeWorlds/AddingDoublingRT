@@ -126,8 +126,52 @@ double planckFunction(double wnumlo, double wnumhi, double temp)
     ans = d[0] - d[1];
 
   ans *= sigdpi * std::pow(temp, 4.0);
-  
+
   return (ans == 0.0) ? 0.0 : ans;
+}
+
+
+
+double planckFunctionDeriv(double wnumlo, double wnumhi, double temp)
+{
+  using namespace PlanckConstants;
+
+  if (temp < 0.0 || wnumhi < wnumlo || wnumlo < 0.0)
+    throw std::invalid_argument("planckFunctionDeriv: invalid arguments");
+
+  if (temp < 1.e-4)
+    return 0.0;
+
+  // Stable Planck shape function f(v) = v^3 / (e^v - 1), valid for all v >= 0.
+  auto fkernel = [](double v) -> double
+  {
+    if (v < 1.e-6) return v * v;             // limit v^3/(e^v - 1) -> v^2 as v->0
+    double em = std::exp(-v);
+    return v * v * v * em / (1.0 - em);      // = v^3/(e^v - 1), overflow-safe
+  };
+
+  // Single-wavenumber (spectral) case: b = c1 wvn^3 / (e^x - 1), x = C2 wvn/T.
+  // db/dT = b * (x/T) / (1 - e^{-x}).
+  if (wnumhi == wnumlo)
+  {
+    double x = C2 * wnumhi / temp;
+    double em = std::exp(-x);
+    double b = 1.1911e-8 * wnumhi * wnumhi * wnumhi * em / (1.0 - em);
+    return b * (x / temp) / (1.0 - em);
+  }
+
+  // Band-integrated case. With B = (sigma/pi)(15/pi^4) T^4 I, I = integral_{v0}^{v1} f,
+  //   dB/dT = 4 B / T  -  (sigma/pi)(15/pi^4) T^3 (v1 f(v1) - v0 f(v0)).
+  double sigdpi = SIGMA / PI;
+  double conc = 15.0 / std::pow(PI, 4.0);
+  double v0 = C2 * wnumlo / temp;
+  double v1 = C2 * wnumhi / temp;
+
+  double B = planckFunction(wnumlo, wnumhi, temp);
+  double boundary = sigdpi * conc * temp * temp * temp
+                    * (v1 * fkernel(v1) - v0 * fkernel(v0));
+
+  return 4.0 * B / temp - boundary;
 }
 
 } // namespace adrt

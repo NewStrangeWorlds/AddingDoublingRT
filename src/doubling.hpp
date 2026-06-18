@@ -68,6 +68,9 @@ LayerMatrices<N> doubling(
       double slope_term = mu[i] * one_minus_t - 0.5 * tau * (1.0 + trans);
       layer.s_up[i]   = B_bar * one_minus_t + B_d * slope_term;
       layer.s_down[i] = B_bar * one_minus_t - B_d * slope_term;
+      // Source-derivative basis (tau > 0 here): a_i = one_minus_t, b_i = slope_term.
+      layer.j_p[i] = 0.5 * one_minus_t - slope_term / tau;
+      layer.j_q[i] = 0.5 * one_minus_t + slope_term / tau;
     }
 
     return layer;
@@ -218,6 +221,9 @@ LayerMatrices<N> doubling(
     result.s_down[i] = y_k[i] * B_bar - z_k[i] * B_d;
     result.s_up_solar[i]   = s_up_sol_k[i];
     result.s_down_solar[i] = s_down_sol_k[i];
+    // Source-derivative basis (tau > 0 here): a_i = y_k, b_i = z_k.
+    result.j_p[i] = 0.5 * y_k[i] - z_k[i] / tau;
+    result.j_q[i] = 0.5 * y_k[i] + z_k[i] / tau;
   }
 
   return result;

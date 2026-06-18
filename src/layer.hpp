@@ -30,12 +30,22 @@ struct LayerMatrices {
   Vec s_up_solar;
   Vec s_down_solar;
 
+  /// Thermal source-derivative basis for analytic temperature Jacobians.
+  /// For a layer bounded by level Planck values B_top, B_bottom:
+  ///   d(s_up)/d(B_top)    = j_p,   d(s_up)/d(B_bottom)    = j_q,
+  ///   d(s_down)/d(B_top)  = j_q,   d(s_down)/d(B_bottom)  = j_p.
+  /// Both are temperature-independent (built from the doubling vectors y, z or
+  /// the pure-absorption coefficients). Zero unless populated by doubling<N>.
+  Vec j_p;
+  Vec j_q;
+
   bool is_scattering = false;
 
   LayerMatrices()
     : T_ab(Matrix<N>::identity()), T_ba(Matrix<N>::identity()),
       s_up(Vec::Zero()), s_down(Vec::Zero()),
-      s_up_solar(Vec::Zero()), s_down_solar(Vec::Zero()) {}
+      s_up_solar(Vec::Zero()), s_down_solar(Vec::Zero()),
+      j_p(Vec::Zero()), j_q(Vec::Zero()) {}
 };
 
 

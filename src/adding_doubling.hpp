@@ -35,6 +35,18 @@ struct RTOutput {
   std::vector<double> mean_intensity;   ///< J = (1/4pi) integral I dOmega, including the direct stellar beam (diffuse-only J = mean_intensity - flux_direct/(4pi*solar_mu))
   std::vector<double> flux_divergence;  ///< Net flux divergence dF/dtau = 4pi(1-omega)(J - B) at each level (DisORT convention: each interface uses the layer above it)
   std::vector<double> flux_direct;      ///< Attenuated direct solar beam flux
+
+  /// Analytic temperature Jacobians (only filled when
+  /// ADConfig::compute_temperature_jacobian is set). Each is indexed
+  /// [interface][dof], where interface = 0..num_layers and dof = 0..num_layers+1:
+  ///   dof 0..num_layers : d/d(temperature[level])
+  ///   dof num_layers+1  : d/d(surface_temperature)
+  /// When driven by planck_levels (no temperatures) these hold d/dB instead
+  /// (the Planck chain rule is skipped). Empty unless requested.
+  std::vector<std::vector<double>> flux_up_temperature_jac;
+  std::vector<std::vector<double>> flux_down_temperature_jac;
+  std::vector<std::vector<double>> mean_intensity_temperature_jac;
+  std::vector<std::vector<double>> flux_divergence_temperature_jac;
 };
 
 
@@ -59,6 +71,7 @@ public:
   bool use_delta_m = false;           ///< Enable delta-M scaling (Wiscombe 1977b)
   bool use_diffusion_lower_bc = false; ///< Use diffusion approximation at lower boundary (stellar atmospheres)
   bool index_from_bottom = false;     ///< If true, user arrays indexed BOA (0) -> TOA
+  bool compute_temperature_jacobian = false; ///< Compute analytic dF/dT, dJ/dT, d(divF)/dT (thermal only; fills RTOutput::*_temperature_jac)
 
   // ======== Boundary conditions ========
   double surface_albedo = 0.0;      ///< Lambertian surface albedo [0, 1]
