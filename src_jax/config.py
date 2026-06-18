@@ -17,7 +17,8 @@ class RTOutput:
     """
     flux_up: jnp.ndarray        # Upward diffuse flux
     flux_down: jnp.ndarray      # Downward diffuse flux
-    mean_intensity: jnp.ndarray # J = (1/4pi) integral I dOmega
+    mean_intensity: jnp.ndarray # J = (1/4pi) integral I dOmega, incl. direct stellar beam (diffuse-only = mean_intensity - flux_direct/(4pi*solar_mu))
+    flux_divergence: jnp.ndarray # Net flux divergence dF/dtau = 4pi(1-omega)(J - B); each interface uses the layer above it (DisORT convention)
     flux_direct: jnp.ndarray    # Attenuated direct solar beam flux
 
 

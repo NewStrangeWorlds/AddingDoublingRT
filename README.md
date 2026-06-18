@@ -34,7 +34,7 @@ An implementation of the adding-doubling method for solving the radiative transf
 
 ## Output
 
-The solver returns upward and downward diffuse fluxes, the attenuated direct beam flux, and the mean intensity at each layer interface (from the top of the atmosphere to the surface).
+The solver returns upward and downward diffuse fluxes, the attenuated direct beam flux, and the mean intensity at each layer interface (from the top of the atmosphere to the surface). Following the DisORT convention, the mean intensity is the full actinic mean intensity including the direct stellar beam; the diffuse-only part is recovered as `mean_intensity - flux_direct / (4*pi*solar_mu)`.
 
 ## Requirements
 

@@ -32,7 +32,8 @@ namespace adrt {
 struct RTOutput {
   std::vector<double> flux_up;          ///< Upward diffuse flux [same unit as B]
   std::vector<double> flux_down;        ///< Downward diffuse flux
-  std::vector<double> mean_intensity;   ///< J = (1/4pi) integral I dOmega
+  std::vector<double> mean_intensity;   ///< J = (1/4pi) integral I dOmega, including the direct stellar beam (diffuse-only J = mean_intensity - flux_direct/(4pi*solar_mu))
+  std::vector<double> flux_divergence;  ///< Net flux divergence dF/dtau = 4pi(1-omega)(J - B) at each level (DisORT convention: each interface uses the layer above it)
   std::vector<double> flux_direct;      ///< Attenuated direct solar beam flux
 };
 

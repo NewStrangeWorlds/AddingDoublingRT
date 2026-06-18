@@ -212,6 +212,7 @@ def solve(config):
     flux_up = np.zeros(n_interfaces)
     flux_down = np.zeros(n_interfaces)
     mean_intensity = np.zeros(n_interfaces)
+    flux_divergence = np.zeros(n_interfaces)
     flux_direct = np.zeros(n_interfaces)
 
     if has_solar:
@@ -269,16 +270,35 @@ def solve(config):
         flux_down[l] = float(jnp.sum(2.0 * PI * wt * mu * Idown))
         mean_intensity[l] = float(jnp.sum(0.5 * wt * (Iup + Idown)))
 
+    # Add the direct (stellar) beam contribution so that mean_intensity is the
+    # FULL actinic mean intensity (matching DisORT). The collimated beam adds
+    # J_dir = F_dir / (4 pi mu0) at each level.
+    if cfg.solar_flux > 0.0 and cfg.solar_mu > 0.0:
+        inv_4pi_mu0 = 1.0 / (4.0 * PI * cfg.solar_mu)
+        for l in range(n_interfaces):
+            mean_intensity[l] += flux_direct[l] * inv_4pi_mu0
+
+    # Net flux divergence dF/dtau = 4 pi (1 - omega) (J - B) at each level.
+    # Following DisORT, each interface uses the single-scattering albedo of the
+    # layer immediately above it (the TOA level uses the topmost layer). omega is
+    # the UNSCALED value and J is the full actinic mean intensity finalized above.
+    for l in range(n_interfaces):
+        lyr = 0 if l == 0 else l - 1
+        flux_divergence[l] = (4.0 * PI * (1.0 - float(cfg.single_scat_albedo[lyr]))
+                              * (mean_intensity[l] - B[l]))
+
     # Reverse output if indexed from bottom
     if cfg.index_from_bottom:
         flux_up = flux_up[::-1]
         flux_down = flux_down[::-1]
         mean_intensity = mean_intensity[::-1]
+        flux_divergence = flux_divergence[::-1]
         flux_direct = flux_direct[::-1]
 
     return RTOutput(
         flux_up=jnp.array(flux_up),
         flux_down=jnp.array(flux_down),
         mean_intensity=jnp.array(mean_intensity),
+        flux_divergence=jnp.array(flux_divergence),
         flux_direct=jnp.array(flux_direct),
     )

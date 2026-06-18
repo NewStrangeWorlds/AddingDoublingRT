@@ -322,6 +322,7 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
   result.flux_up.resize(n_interfaces, 0.0);
   result.flux_down.resize(n_interfaces, 0.0);
   result.mean_intensity.resize(n_interfaces, 0.0);
+  result.flux_divergence.resize(n_interfaces, 0.0);
   result.flux_direct.resize(n_interfaces, 0.0);
 
   if (cfg.solar_flux > 0.0 && cfg.solar_mu > 0.0) 
@@ -386,12 +387,35 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
     }
   }
 
+  // Add the direct (stellar) beam contribution so that mean_intensity is the
+  // FULL actinic mean intensity (matching DisORT). The collimated beam adds
+  // J_dir = F_dir / (4 pi mu0) at each level, where F_dir is the (vertical)
+  // direct flux already stored in flux_direct.
+  if (cfg.solar_flux > 0.0 && cfg.solar_mu > 0.0)
+  {
+    double inv_4pi_mu0 = 1.0 / (4.0 * PI * cfg.solar_mu);
+    for (int l = 0; l < n_interfaces; ++l)
+      result.mean_intensity[l] += result.flux_direct[l] * inv_4pi_mu0;
+  }
+
+  // Net flux divergence dF/dtau = 4 pi (1 - omega) (J - B) at each level.
+  // Following DisORT, each interface uses the single-scattering albedo of the
+  // layer immediately above it (the TOA level uses the topmost layer). omega is
+  // the UNSCALED value and J is the full actinic mean intensity finalized above.
+  for (int l = 0; l < n_interfaces; ++l)
+  {
+    int lyr = (l == 0) ? 0 : l - 1;
+    result.flux_divergence[l] = 4.0 * PI * (1.0 - cfg.single_scat_albedo[lyr])
+                                * (result.mean_intensity[l] - B[l]);
+  }
+
   // Reverse output if indexed from bottom
-  if (cfg.index_from_bottom) 
+  if (cfg.index_from_bottom)
   {
     std::reverse(result.flux_up.begin(), result.flux_up.end());
     std::reverse(result.flux_down.begin(), result.flux_down.end());
     std::reverse(result.mean_intensity.begin(), result.mean_intensity.end());
+    std::reverse(result.flux_divergence.begin(), result.flux_divergence.end());
     std::reverse(result.flux_direct.begin(), result.flux_direct.end());
   }
 
@@ -996,6 +1020,7 @@ static RTOutput solveDynamic(
   result.flux_up.resize(n_interfaces, 0.0);
   result.flux_down.resize(n_interfaces, 0.0);
   result.mean_intensity.resize(n_interfaces, 0.0);
+  result.flux_divergence.resize(n_interfaces, 0.0);
   result.flux_direct.resize(n_interfaces, 0.0);
 
   if (cfg.solar_flux > 0.0 && cfg.solar_mu > 0.0) 
@@ -1098,11 +1123,34 @@ static RTOutput solveDynamic(
     }
   }
 
-  if (cfg.index_from_bottom) 
+  // Add the direct (stellar) beam contribution so that mean_intensity is the
+  // FULL actinic mean intensity (matching DisORT). The collimated beam adds
+  // J_dir = F_dir / (4 pi mu0) at each level, where F_dir is the (vertical)
+  // direct flux already stored in flux_direct.
+  if (cfg.solar_flux > 0.0 && cfg.solar_mu > 0.0)
+  {
+    double inv_4pi_mu0 = 1.0 / (4.0 * PI * cfg.solar_mu);
+    for (int l = 0; l < n_interfaces; ++l)
+      result.mean_intensity[l] += result.flux_direct[l] * inv_4pi_mu0;
+  }
+
+  // Net flux divergence dF/dtau = 4 pi (1 - omega) (J - B) at each level.
+  // Following DisORT, each interface uses the single-scattering albedo of the
+  // layer immediately above it (the TOA level uses the topmost layer). omega is
+  // the UNSCALED value and J is the full actinic mean intensity finalized above.
+  for (int l = 0; l < n_interfaces; ++l)
+  {
+    int lyr = (l == 0) ? 0 : l - 1;
+    result.flux_divergence[l] = 4.0 * PI * (1.0 - cfg.single_scat_albedo[lyr])
+                                * (result.mean_intensity[l] - B[l]);
+  }
+
+  if (cfg.index_from_bottom)
   {
     std::reverse(result.flux_up.begin(), result.flux_up.end());
     std::reverse(result.flux_down.begin(), result.flux_down.end());
     std::reverse(result.mean_intensity.begin(), result.mean_intensity.end());
+    std::reverse(result.flux_divergence.begin(), result.flux_divergence.end());
     std::reverse(result.flux_direct.begin(), result.flux_direct.end());
   }
 

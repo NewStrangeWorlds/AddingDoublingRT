@@ -195,6 +195,64 @@ TEST(ADSolver, PureAbsorption_LambertianSurface) {
 
 
 // ============================================================================
+//  Mean intensity convention: includes the direct stellar beam (DisORT-style)
+// ============================================================================
+
+TEST(ADSolver, MeanIntensityIncludesDirectBeam) {
+  // Pure absorption, black surface, no scattering, no thermal: the diffuse
+  // field is zero everywhere, so the mean intensity must equal exactly the
+  // collimated beam's actinic contribution J_dir = F0 * exp(-tau/mu0) / (4 pi).
+  adrt::ADConfig cfg(2, 8);
+  cfg.solar_flux = 100.0;
+  cfg.solar_mu = 0.6;
+  cfg.surface_albedo = 0.0;
+  cfg.allocate();
+  cfg.delta_tau[0] = 0.4;
+  cfg.delta_tau[1] = 0.6;
+  cfg.single_scat_albedo[0] = 0.0;
+  cfg.single_scat_albedo[1] = 0.0;
+  cfg.setIsotropic();
+
+  auto r = adrt::solve(cfg);
+
+  double tau_cum = 0.0;
+  for (int l = 0; l <= 2; ++l) {
+    double expected = cfg.solar_flux * std::exp(-tau_cum / cfg.solar_mu) / (4.0 * PI);
+    EXPECT_NEAR(r.mean_intensity[l], expected, 1e-9);
+    // Cross-check the documented recovery of the diffuse-only part (= 0 here).
+    double diffuse = r.mean_intensity[l] - r.flux_direct[l] / (4.0 * PI * cfg.solar_mu);
+    EXPECT_NEAR(diffuse, 0.0, 1e-9);
+    if (l < 2) tau_cum += cfg.delta_tau[l];
+  }
+}
+
+TEST(ADSolver, MeanIntensityThermalUnaffectedByBeamTerm) {
+  // No solar beam: mean intensity is purely diffuse and must stay positive.
+  adrt::ADConfig cfg(3, 8);
+  cfg.use_thermal_emission = true;
+  cfg.wavenumber_low = 500.0;
+  cfg.wavenumber_high = 600.0;
+  cfg.surface_albedo = 0.0;
+  cfg.allocate();
+  std::vector<double> T = {200.0, 230.0, 260.0, 290.0};
+  for (int l = 0; l < 3; ++l) {
+    cfg.delta_tau[l] = 0.5;
+    cfg.single_scat_albedo[l] = 0.0;
+    cfg.temperature[l] = T[l];
+  }
+  cfg.temperature[3] = T[3];
+  cfg.setIsotropic();
+
+  auto r = adrt::solve(cfg);
+  for (int l = 0; l <= 3; ++l) {
+    EXPECT_GT(r.mean_intensity[l], 0.0);
+    // No beam -> flux_direct is zero, so no actinic term was added.
+    EXPECT_NEAR(r.flux_direct[l], 0.0, 1e-12);
+  }
+}
+
+
+// ============================================================================
 //  Test 1a-1d: Isotropic Scattering (VH1 Table 12)
 //  Ref: CDISORT disotest cases 1a-1d
 //  F0 = 10*pi, mu0 = 0.1, surface_albedo = 0, Lambertian
@@ -1695,7 +1753,103 @@ TEST(ADSolver, IndexFromBottom) {
     EXPECT_NEAR(r_top.flux_down[l], r_bot.flux_down[3 - l], 1e-12);
     EXPECT_NEAR(r_top.flux_direct[l], r_bot.flux_direct[3 - l], 1e-12);
     EXPECT_NEAR(r_top.mean_intensity[l], r_bot.mean_intensity[3 - l], 1e-12);
+    EXPECT_NEAR(r_top.flux_divergence[l], r_bot.flux_divergence[3 - l], 1e-12);
   }
+}
+
+
+// ============================================================================
+//  Flux divergence: dF_net/dtau = 4 pi (1 - omega) (J - B)
+// ============================================================================
+
+TEST(ADSolver, FluxDivergenceIsothermalEquilibrium) {
+  // Isothermal column + black surface at the same temperature, no solar: the
+  // field is isotropic (I = B), so J = B and the divergence vanishes at every
+  // level. Guards the (J - B) term and the omega/B indexing.
+  adrt::ADConfig cfg(5, 8);
+  cfg.use_thermal_emission = true;
+  cfg.wavenumber_low = 300.0;
+  cfg.wavenumber_high = 800.0;
+  cfg.surface_albedo = 0.0;
+  cfg.allocate();
+  for (int l = 0; l < 5; ++l) {
+    cfg.delta_tau[l] = 0.4;
+    cfg.single_scat_albedo[l] = 0.0;
+    cfg.temperature[l] = 255.0;
+  }
+  cfg.temperature[5] = 255.0;
+  cfg.setIsotropic();
+
+  auto r = adrt::solve(cfg);
+  for (int l = 0; l <= 5; ++l)
+    EXPECT_NEAR(r.flux_divergence[l], 0.0, 1e-9);
+}
+
+TEST(ADSolver, FluxDivergenceMatchesNetFluxGradient) {
+  // Exact monochromatic identity: dF_net/dtau = 4 pi (1-omega)(J - B), so the
+  // integral of the divergence over optical depth equals the net-flux change
+  // across the column. Checked on a fine grid via the trapezoidal rule.
+  // Net flux (upward positive) = flux_up - flux_down - flux_direct.
+  int nlay = 60;
+  adrt::ADConfig cfg(nlay, 8);
+  cfg.use_thermal_emission = true;
+  cfg.wavenumber_low = 300.0;
+  cfg.wavenumber_high = 800.0;
+  cfg.surface_albedo = 0.0;
+  cfg.allocate();
+  for (int l = 0; l < nlay; ++l) {
+    cfg.delta_tau[l] = 0.05;
+    cfg.single_scat_albedo[l] = 0.5;
+    cfg.temperature[l] = 200.0 + 1.5 * l;
+  }
+  cfg.temperature[nlay] = 200.0 + 1.5 * nlay;
+  cfg.setIsotropic();
+
+  auto r = adrt::solve(cfg);
+
+  std::vector<double> tau(nlay + 1, 0.0);
+  for (int l = 0; l < nlay; ++l) tau[l + 1] = tau[l] + cfg.delta_tau[l];
+
+  double integral = 0.0;
+  for (int l = 0; l < nlay; ++l)
+    integral += 0.5 * (r.flux_divergence[l] + r.flux_divergence[l + 1])
+                * (tau[l + 1] - tau[l]);
+
+  auto fnet = [&](int l) { return r.flux_up[l] - r.flux_down[l] - r.flux_direct[l]; };
+  double dFnet = fnet(nlay) - fnet(0);  // surface - TOA
+
+  EXPECT_NEAR(integral, dFnet, 0.01 * std::abs(dFnet));
+}
+
+TEST(ADSolver, FluxDivergenceSolarAbsorption) {
+  // Pure-absorption solar beam: integrated divergence equals the net-flux
+  // change (all the absorbed beam energy), with no thermal source.
+  int nlay = 40;
+  adrt::ADConfig cfg(nlay, 8);
+  cfg.solar_flux = 200.0;
+  cfg.solar_mu = 0.5;
+  cfg.surface_albedo = 0.0;
+  cfg.allocate();
+  for (int l = 0; l < nlay; ++l) {
+    cfg.delta_tau[l] = 0.05;
+    cfg.single_scat_albedo[l] = 0.0;
+  }
+  cfg.setIsotropic();
+
+  auto r = adrt::solve(cfg);
+
+  std::vector<double> tau(nlay + 1, 0.0);
+  for (int l = 0; l < nlay; ++l) tau[l + 1] = tau[l] + cfg.delta_tau[l];
+
+  double integral = 0.0;
+  for (int l = 0; l < nlay; ++l)
+    integral += 0.5 * (r.flux_divergence[l] + r.flux_divergence[l + 1])
+                * (tau[l + 1] - tau[l]);
+
+  auto fnet = [&](int l) { return r.flux_up[l] - r.flux_down[l] - r.flux_direct[l]; };
+  double dFnet = fnet(nlay) - fnet(0);
+
+  EXPECT_NEAR(integral, dFnet, 0.01 * std::abs(dFnet));
 }
 
 
