@@ -933,6 +933,7 @@ __global__ void batchedBoundaryIntensityKernel(
     float top_emission_scalar,
     float surface_emission_scalar,
     float surface_temperature,        // < 0: use bottom level temperature
+    float top_temperature,            // < 0: use top level temperature
     double wavenumber_low, double wavenumber_high,
     bool use_thermal_emission,
     bool use_diffusion_lower_bc,
@@ -953,7 +954,10 @@ __global__ void batchedBoundaryIntensityKernel(
 
   // Top boundary
   float B_top;
-  if (use_thermal_emission) {
+  if (use_thermal_emission && top_temperature >= 0.0f) {
+    B_top = planck_function(wavenumber_low, wavenumber_high,
+                            static_cast<double>(top_temperature));
+  } else if (use_thermal_emission) {
     B_top = B_levels[w * nlev + 0];
   } else if (per_wav_top_emission != nullptr) {
     B_top = per_wav_top_emission[w];

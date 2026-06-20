@@ -29,6 +29,7 @@ struct BatchConfig {
   double surface_emission = 0.0;
   double surface_temperature = -1.0;  ///< Surface (skin) temperature [K]; if >= 0 and use_thermal_emission, the surface emits at this temperature instead of the bottom level temperature
   double top_emission = 0.0;
+  double top_temperature = -1.0;  ///< Top-boundary temperature [K]; if >= 0 and use_thermal_emission, TOA downwelling is B(top_temperature) instead of the top level temperature (set 0 for cold space, matching DisORT)
   double solar_flux = 0.0;
   double solar_mu = 1.0;
 

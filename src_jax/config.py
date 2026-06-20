@@ -36,7 +36,9 @@ class ADConfig:
 
     surface_albedo: float = 0.0
     surface_emission: float = 0.0
+    surface_temperature: float = -1.0  # Surface (skin) temperature [K]; if >= 0 and use_thermal_emission, the surface emits at this temperature instead of temperature[num_layers]
     top_emission: float = 0.0
+    top_temperature: float = -1.0  # Top-boundary temperature [K]; if >= 0 and use_thermal_emission, TOA downwelling is B(top_temperature) instead of temperature[0] (set 0 for cold space, matching DisORT)
     solar_flux: float = 0.0
     solar_mu: float = 1.0
 
@@ -93,6 +95,13 @@ class ADConfig:
                     raise ValueError(f"temperature[{l}] < 0")
             if self.wavenumber_low < 0.0 or self.wavenumber_high < self.wavenumber_low:
                 raise ValueError("invalid wavenumber range")
+        else:
+            if self.surface_temperature >= 0.0:
+                raise ValueError("surface_temperature requires use_thermal_emission "
+                                 "(use surface_emission for raw thermal sources)")
+            if self.top_temperature >= 0.0:
+                raise ValueError("top_temperature requires use_thermal_emission "
+                                 "(use top_emission for raw thermal sources)")
 
     def set_henyey_greenstein(self, g, layer=-1):
         """Set single Henyey-Greenstein phase function."""

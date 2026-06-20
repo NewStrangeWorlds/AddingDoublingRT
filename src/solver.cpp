@@ -394,7 +394,13 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
     B_surface = (cfg.surface_temperature >= 0.0)
                   ? planckFunction(cfg.wavenumber_low, cfg.wavenumber_high, cfg.surface_temperature)
                   : B[nlay];
-    B_top_emission = B[0];
+
+    // Top-boundary (TOA downwelling) emission. By default the model top emits
+    // downward at the top level temperature; a distinct top temperature
+    // decouples it (set 0 for cold space / no downwelling, matching DisORT).
+    B_top_emission = (cfg.top_temperature >= 0.0)
+                  ? planckFunction(cfg.wavenumber_low, cfg.wavenumber_high, cfg.top_temperature)
+                  : B[0];
   }
   else if (static_cast<int>(cfg.planck_levels.size()) == nlay + 1) 
   {
@@ -1350,7 +1356,13 @@ static RTOutput solveDynamic(
     B_surface = (cfg.surface_temperature >= 0.0)
                   ? planckFunction(cfg.wavenumber_low, cfg.wavenumber_high, cfg.surface_temperature)
                   : B[nlay];
-    B_top_emission = B[0];
+
+    // Top-boundary (TOA downwelling) emission. By default the model top emits
+    // downward at the top level temperature; a distinct top temperature
+    // decouples it (set 0 for cold space / no downwelling, matching DisORT).
+    B_top_emission = (cfg.top_temperature >= 0.0)
+                  ? planckFunction(cfg.wavenumber_low, cfg.wavenumber_high, cfg.top_temperature)
+                  : B[0];
   }
   else if (static_cast<int>(cfg.planck_levels.size()) == nlay + 1) 
   {

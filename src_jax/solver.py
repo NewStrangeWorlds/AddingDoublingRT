@@ -69,8 +69,13 @@ def solve(config):
     if cfg.use_thermal_emission:
         for l in range(nlay + 1):
             B[l] = planck_function(cfg.wavenumber_low, cfg.wavenumber_high, cfg.temperature[l])
-        B_surface = B[nlay]
-        B_top_emission = B[0]
+        # Surface (skin) emission: a distinct surface temperature decouples the
+        # ground from the bottom atmospheric level. Top-boundary (TOA downwelling)
+        # emission: a distinct top temperature decouples it (0 = cold space).
+        B_surface = (planck_function(cfg.wavenumber_low, cfg.wavenumber_high, cfg.surface_temperature)
+                     if cfg.surface_temperature >= 0.0 else B[nlay])
+        B_top_emission = (planck_function(cfg.wavenumber_low, cfg.wavenumber_high, cfg.top_temperature)
+                          if cfg.top_temperature >= 0.0 else B[0])
     elif cfg.planck_levels is not None and len(cfg.planck_levels) == nlay + 1:
         B = np.array(cfg.planck_levels)
         B_surface = cfg.surface_emission

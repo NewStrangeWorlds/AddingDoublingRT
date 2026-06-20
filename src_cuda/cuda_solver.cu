@@ -42,6 +42,7 @@ struct DeviceBatchConfig {
   float surface_emission;
   float surface_temperature;
   float top_emission;
+  float top_temperature;
   float solar_flux;
   float solar_mu;
   float wavenumber_low;
@@ -428,6 +429,17 @@ __global__ void solveKernel(
   if (has_raw || (cfg.use_thermal_emission && temperature != nullptr))
     B_top_emission = B_prev;
 
+  // Decoupled top-boundary temperature: TOA downwelling at top_temperature
+  // instead of the top level temperature (0 => cold space, matching DisORT).
+  if (cfg.top_temperature >= 0.0f && (has_raw || cfg.use_thermal_emission)) {
+    B_top_emission = has_raw
+                  ? planck_single(cfg.top_temperature,
+                                  static_cast<float>(raw_wavenumber[w]))
+                  : planck_function(static_cast<double>(cfg.wavenumber_low),
+                                    static_cast<double>(cfg.wavenumber_high),
+                                    static_cast<double>(cfg.top_temperature));
+  }
+
   // --- 3. Boundary intensities ---
   GpuVec<N> I_top_down;
   vec_set_scalar<N>(I_top_down, B_top_emission);
@@ -787,6 +799,13 @@ __global__ void solveKernelWarp(
   if (cfg.use_thermal_emission && temperature != nullptr)
     B_top_emission = B_prev;
 
+  // Decoupled top-boundary temperature (thermal emission only).
+  if (cfg.top_temperature >= 0.0f && cfg.use_thermal_emission) {
+    B_top_emission = planck_function(static_cast<double>(cfg.wavenumber_low),
+                                     static_cast<double>(cfg.wavenumber_high),
+                                     static_cast<double>(cfg.top_temperature));
+  }
+
   // --- 3. Boundary intensities (distributed: each thread holds its element) ---
   float I_top_down = B_top_emission;
   float I_bot_up = 0.0f;
@@ -860,6 +879,7 @@ void solveBatch(
   dcfg.surface_emission = static_cast<float>(config.surface_emission);
   dcfg.surface_temperature = static_cast<float>(config.surface_temperature);
   dcfg.top_emission = static_cast<float>(config.top_emission);
+  dcfg.top_temperature = static_cast<float>(config.top_temperature);
   dcfg.solar_flux = static_cast<float>(config.solar_flux);
   dcfg.solar_mu = static_cast<float>(config.solar_mu);
   dcfg.wavenumber_low = static_cast<float>(config.wavenumber_low);
@@ -1199,6 +1219,7 @@ void solveBatchFromCoefficients(
   dcfg.surface_emission = 0.0f;  // computed inline
   dcfg.surface_temperature = static_cast<float>(config.surface_temperature);
   dcfg.top_emission = 0.0f;      // computed inline
+  dcfg.top_temperature = static_cast<float>(config.top_temperature);
   dcfg.solar_flux = static_cast<float>(config.solar_flux);
   dcfg.solar_mu = static_cast<float>(config.solar_mu);
   dcfg.wavenumber_low = 0.0f;

@@ -866,6 +866,58 @@ class TestThermalEmission:
             assert not math.isnan(float(r.flux_up[l]))
             assert not math.isnan(float(r.flux_down[l]))
 
+    def _boundary_cfg(self, surf_T=-1.0, top_T=-1.0):
+        cfg = ADConfig(num_layers=3, num_quadrature=8)
+        cfg.use_thermal_emission = True
+        cfg.wavenumber_low = 500.0
+        cfg.wavenumber_high = 600.0
+        cfg.surface_albedo = 0.0
+        cfg.surface_temperature = surf_T
+        cfg.top_temperature = top_T
+        cfg.allocate()
+        T = [200.0, 230.0, 260.0, 290.0]
+        for l in range(3):
+            cfg.delta_tau[l] = 0.5
+            cfg.single_scat_albedo[l] = 0.0
+            cfg.temperature[l] = T[l]
+        cfg.temperature[3] = T[3]
+        cfg.set_isotropic()
+        return cfg
+
+    def test_top_temperature(self):
+        """top_temperature controls TOA downwelling: flux_down[0] = pi*B_top."""
+        B0 = planck_function(500.0, 600.0, 200.0)
+        r_def = solve(self._boundary_cfg())            # sentinel -> B(temperature[0])
+        assert abs(float(r_def.flux_down[0]) - math.pi * B0) < 1e-6 * math.pi * B0
+
+        r_cold = solve(self._boundary_cfg(top_T=0.0))  # cold space (DisORT default)
+        assert abs(float(r_cold.flux_down[0])) < 1e-9
+
+        Bhot = planck_function(500.0, 600.0, 260.0)
+        r_hot = solve(self._boundary_cfg(top_T=260.0))
+        assert abs(float(r_hot.flux_down[0]) - math.pi * Bhot) < 1e-6 * math.pi * Bhot
+
+    def test_surface_temperature(self):
+        """A hotter surface (skin) temperature raises the emergent flux."""
+        r_def = solve(self._boundary_cfg())
+        r_hot = solve(self._boundary_cfg(surf_T=330.0))
+        assert float(r_hot.flux_up[0]) > float(r_def.flux_up[0])
+        # Explicit surface temperature equal to the bottom level reproduces sentinel.
+        r_match = solve(self._boundary_cfg(surf_T=290.0))
+        assert abs(float(r_match.flux_up[0]) - float(r_def.flux_up[0])) < 1e-9
+
+    def test_boundary_temperature_requires_thermal(self):
+        for field in ("surface_temperature", "top_temperature"):
+            cfg = ADConfig(num_layers=1, num_quadrature=8)
+            cfg.use_thermal_emission = False
+            setattr(cfg, field, 250.0)
+            cfg.allocate()
+            cfg.delta_tau[0] = 1.0
+            cfg.single_scat_albedo[0] = 0.0
+            cfg.set_isotropic()
+            with pytest.raises(ValueError):
+                cfg.validate()
+
 
 # ============================================================================
 #  Energy Conservation Tests

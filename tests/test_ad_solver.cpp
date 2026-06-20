@@ -1040,6 +1040,60 @@ TEST(ADConfig, SurfaceTemperatureRequiresThermalEmission) {
   EXPECT_THROW(cfg.validate(), std::invalid_argument);
 }
 
+TEST(ADSolver, ThermalTopTemperature) {
+  // Decoupled top-boundary temperature controls the TOA downwelling intensity.
+  // At the top interface I_top_down = B_top for every stream, so
+  // flux_down[0] = 2 pi B_top * sum(wt*mu) = pi * B_top exactly.
+  auto make = [](double top_T) {
+    adrt::ADConfig cfg(3, 8);
+    cfg.use_thermal_emission = true;
+    cfg.wavenumber_low = 500.0;
+    cfg.wavenumber_high = 600.0;
+    cfg.surface_albedo = 0.0;
+    cfg.top_temperature = top_T;
+    cfg.allocate();
+    std::vector<double> T = {200.0, 230.0, 260.0, 290.0};
+    for (int l = 0; l < 3; ++l) {
+      cfg.delta_tau[l] = 0.5;
+      cfg.single_scat_albedo[l] = 0.0;
+      cfg.temperature[l] = T[l];
+    }
+    cfg.temperature[3] = T[3];
+    cfg.setIsotropic();
+    return cfg;
+  };
+
+  double B0 = adrt::planckFunction(500.0, 600.0, 200.0);  // B(temperature[0])
+
+  // Sentinel (< 0): TOA downwelling = pi * B(temperature[0]) (current default).
+  auto r_def = adrt::solve(make(-1.0));
+  EXPECT_NEAR(r_def.flux_down[0], PI * B0, 1e-6 * PI * B0);
+
+  // top_temperature = 0 -> cold space, no downwelling at TOA (DisORT default).
+  auto r_cold = adrt::solve(make(0.0));
+  EXPECT_NEAR(r_cold.flux_down[0], 0.0, 1e-9);
+
+  // Explicit top temperature equal to temperature[0] reproduces the sentinel.
+  auto r_match = adrt::solve(make(200.0));
+  EXPECT_NEAR(r_match.flux_down[0], r_def.flux_down[0], 1e-9);
+
+  // A custom top temperature emits pi * B(top_temperature) downward.
+  auto r_hot = adrt::solve(make(260.0));
+  double Bhot = adrt::planckFunction(500.0, 600.0, 260.0);
+  EXPECT_NEAR(r_hot.flux_down[0], PI * Bhot, 1e-6 * PI * Bhot);
+}
+
+TEST(ADConfig, TopTemperatureRequiresThermalEmission) {
+  adrt::ADConfig cfg(1, 8);
+  cfg.use_thermal_emission = false;
+  cfg.top_temperature = 250.0;
+  cfg.allocate();
+  cfg.delta_tau[0] = 1.0;
+  cfg.single_scat_albedo[0] = 0.0;
+  cfg.setIsotropic();
+  EXPECT_THROW(cfg.validate(), std::invalid_argument);
+}
+
 TEST(ADSolver, ThermalScattering) {
   // Thermal + scattering: 4-layer isotropic, omega=1.0
   adrt::ADConfig cfg(4, 8);

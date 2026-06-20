@@ -969,6 +969,7 @@ void solveBatchedCublas(
       static_cast<float>(config.top_emission),
       static_cast<float>(config.surface_emission),
       static_cast<float>(config.surface_temperature),
+      static_cast<float>(config.top_temperature),
       config.wavenumber_low, config.wavenumber_high,
       config.use_thermal_emission,
       config.use_diffusion_lower_bc,

@@ -141,6 +141,7 @@ static CUDAResult cudaSolveSingle(const adrt::ADConfig& config)
   bcfg.surface_emission = config.surface_emission;
   bcfg.surface_temperature = config.surface_temperature;
   bcfg.top_emission = config.top_emission;
+  bcfg.top_temperature = config.top_temperature;
   bcfg.solar_flux = config.solar_flux;
   bcfg.solar_mu = config.solar_mu;
   bcfg.wavenumber_low = config.wavenumber_low;
@@ -782,6 +783,51 @@ void test_thermal_surface_temperature() {
     cfg_def.surface_temperature = -1.0;
     auto cuda_def = cudaSolveSingle(cfg_def);
     CHECK_TRUE("surfT_hotter_emits_more", cuda.flux_up > cuda_def.flux_up);
+  }
+  std::cout << "done\n";
+}
+
+
+void test_thermal_top_temperature() {
+  std::cout << "  test_thermal_top_temperature ... ";
+
+  // Decoupled top-boundary temperature, CPU vs CUDA. It sets the TOA
+  // downwelling intensity, so flux_down at the top interface is the cleanest
+  // observable. nq=8 -> single-thread kernel, nq=16 -> cuBLAS batched path.
+  for (int nq : {8, 16}) {
+    auto make = [&](double top_T) {
+      adrt::ADConfig cfg(3, nq);
+      cfg.use_thermal_emission = true;
+      cfg.wavenumber_low = 500.0;
+      cfg.wavenumber_high = 600.0;
+      cfg.surface_albedo = 0.0;
+      cfg.top_temperature = top_T;
+      cfg.allocate();
+      std::vector<double> T = {200.0, 230.0, 260.0, 290.0};
+      for (int l = 0; l < 3; ++l) {
+        cfg.delta_tau[l] = 0.5;
+        cfg.single_scat_albedo[l] = 0.0;
+        cfg.temperature[l] = T[l];
+      }
+      cfg.temperature[3] = T[3];
+      cfg.setIsotropic();
+      return cfg;
+    };
+
+    // Cold space (top_temperature = 0): no TOA downwelling.
+    auto cfg_cold = make(0.0);
+    auto cpu_cold = cpuSolve(cfg_cold);
+    auto cuda_cold = cudaSolveSingle(cfg_cold);
+    CHECK_NEAR("topT_cold_flux_down", cuda_cold.flux_down, cpu_cold.flux_down[0], 1e-4);
+    CHECK_TRUE("topT_cold_is_zero", std::abs(cuda_cold.flux_down) < 1e-4);
+
+    // Hot top boundary emits downward; CUDA must match CPU.
+    auto cfg_hot = make(260.0);
+    auto cpu_hot = cpuSolve(cfg_hot);
+    auto cuda_hot = cudaSolveSingle(cfg_hot);
+    double tol = 0.01 * std::abs(cpu_hot.flux_down[0]) + 0.1;
+    CHECK_NEAR("topT_hot_flux_down", cuda_hot.flux_down, cpu_hot.flux_down[0], tol);
+    CHECK_TRUE("topT_hot_more_down", cuda_hot.flux_down > cuda_cold.flux_down);
   }
   std::cout << "done\n";
 }
@@ -1886,6 +1932,7 @@ int main() {
   test_thermal_pure_absorption();
   test_thermal_scattering();
   test_thermal_surface_temperature();
+  test_thermal_top_temperature();
   test_thermal_hg_deltam();
 
   // Linear source (analytical)

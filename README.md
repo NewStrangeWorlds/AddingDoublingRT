@@ -131,6 +131,15 @@ cfg.allocate();
 adrt::RTOutput result = adrt::solve(cfg);
 ```
 
+By default the surface emits at the bottom level temperature and the model top
+emits downward at the top level temperature (`temperature[0]`). Both boundaries
+can be decoupled from the atmosphere, following the DisORT convention:
+
+```cpp
+cfg.surface_temperature = 320.0;  // surface (skin) temperature, distinct from temperature[num_layers]
+cfg.top_temperature     = 0.0;    // cold space: no downwelling at TOA (DisORT default); omit/-1 keeps B(temperature[0])
+```
+
 ### JAX API (single wavenumber)
 
 ```python
