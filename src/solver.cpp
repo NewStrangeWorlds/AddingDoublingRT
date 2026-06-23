@@ -212,8 +212,12 @@ static void computeTemperatureJacobian(
   }
 
   // --- Boundary-intensity derivatives ---------------------------------------
-  Block dItop_dn = Block::Zero(N, ndof);   // I_top_down = B[0] * 1  (thermal)
-  if (thermal)
+  // TOA downwelling: I_top_down = B_top_emission. With the default
+  // (top_temperature < 0) this is B[0], so it depends on level-temperature DOF 0.
+  // With an explicit top_temperature it is B(top_temperature) -- independent of
+  // every level/surface DOF here -- so the boundary derivative is zero.
+  Block dItop_dn = Block::Zero(N, ndof);
+  if (thermal && cfg.top_temperature < 0.0)
     for (int i = 0; i < N; ++i) dItop_dn(i, 0) = 1.0;
 
   Block dIbot_up = Block::Zero(N, ndof);
@@ -1181,8 +1185,11 @@ static void computeTemperatureJacobianDynamic(
                   dRtop_up[l + 1], dRtop_dn[l + 1]);
   }
 
+  // TOA downwelling derivative: nonzero only when I_top_down = B[0]
+  // (top_temperature < 0). An explicit top_temperature makes it independent of
+  // every level/surface DOF. See computeTemperatureJacobian for the rationale.
   Mat dItop_dn = Mat::Zero(nmu, ndof);
-  if (thermal)
+  if (thermal && cfg.top_temperature < 0.0)
     for (int i = 0; i < nmu; ++i) dItop_dn(i, 0) = 1.0;
 
   Mat dIbot_up = Mat::Zero(nmu, ndof);

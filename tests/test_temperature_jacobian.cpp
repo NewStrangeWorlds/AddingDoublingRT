@@ -222,3 +222,45 @@ TEST(TemperatureJacobian, DynamicPathAbsorptionAndDiffusionBC) {
     runCase(cfg);
   }
 }
+
+// Regression: with an explicit top_temperature the TOA downwelling no longer
+// depends on temperature[0], so the Jacobian must not attribute a boundary
+// sensitivity to column 0. (The default top boundary, B(temperature[0]), is
+// already covered above; this exercises the decoupled case the other tests
+// missed.)
+TEST(TemperatureJacobian, ColdSpaceTopBoundary) {
+  // Cold space (top_temperature = 0, matching DisORT's default), scattering,
+  // distinct surface. Templated path.
+  ADConfig cfg = baseThermal(4, 8);
+  for (int l = 0; l < cfg.num_layers; ++l) {
+    cfg.single_scat_albedo[l] = 0.6;
+    cfg.setHenyeyGreenstein(0.5, l);
+  }
+  cfg.surface_albedo = 0.2;
+  cfg.surface_temperature = 250.0;
+  cfg.top_temperature = 0.0;
+  runCase(cfg);
+}
+
+TEST(TemperatureJacobian, ExplicitTopBoundary) {
+  // Finite, distinct top-boundary temperature. Pure absorption (templated) and
+  // scattering on the dynamic path.
+  {
+    ADConfig cfg = baseThermal(4, 8);
+    for (int l = 0; l < cfg.num_layers; ++l) cfg.single_scat_albedo[l] = 0.0;
+    cfg.surface_albedo = 0.0;
+    cfg.top_temperature = 180.0;
+    runCase(cfg);
+  }
+  {
+    ADConfig cfg = baseThermal(5, 6);   // dynamic path
+    for (int l = 0; l < cfg.num_layers; ++l) {
+      cfg.single_scat_albedo[l] = 0.6;
+      cfg.setHenyeyGreenstein(0.5, l);
+    }
+    cfg.surface_albedo = 0.3;
+    cfg.surface_temperature = 250.0;
+    cfg.top_temperature = 210.0;
+    runCase(cfg);
+  }
+}
