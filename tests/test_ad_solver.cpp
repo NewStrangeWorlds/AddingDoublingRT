@@ -1908,6 +1908,113 @@ TEST(ADSolver, FluxDivergenceSolarAbsorption) {
 
 
 // ============================================================================
+//  Thermal/stellar net-flux split (compute_flux_components)
+// ============================================================================
+
+// Build a mixed thermal+solar, scattering, surface-bounded atmosphere.
+static adrt::ADConfig makeSplitConfig(int nlay, int nquad) {
+  adrt::ADConfig cfg(nlay, nquad);
+  cfg.use_thermal_emission = true;
+  cfg.wavenumber_low = 100.0;
+  cfg.wavenumber_high = 1500.0;
+  cfg.surface_albedo = 0.25;
+  cfg.solar_flux = 1368.0;
+  cfg.solar_mu = 0.6;
+  cfg.allocate();
+  for (int l = 0; l < nlay; ++l) {
+    cfg.delta_tau[l] = 0.05 * (l + 1);
+    cfg.single_scat_albedo[l] = 0.4;
+    cfg.setRayleigh(l);
+  }
+  for (int l = 0; l <= nlay; ++l) cfg.temperature[l] = 180.0 + 1.5 * l;
+  return cfg;
+}
+
+TEST(ADSolver, FluxComponentsSumToTotal) {
+  // net_flux_thermal + net_flux_stellar must equal the total net upward flux
+  // (flux_up - flux_down - flux_direct) at every interface, for templated and
+  // dynamic quadrature orders.
+  for (int nq : {4, 8, 16, 6 /* dynamic path */}) {
+    int nlay = 20;
+    adrt::ADConfig cfg = makeSplitConfig(nlay, nq);
+    cfg.compute_flux_components = true;
+    auto r = adrt::solve(cfg);
+
+    EXPECT_EQ(static_cast<int>(r.net_flux_thermal.size()), nlay + 1);
+    EXPECT_EQ(static_cast<int>(r.net_flux_stellar.size()), nlay + 1);
+    if (static_cast<int>(r.net_flux_thermal.size()) != nlay + 1 ||
+        static_cast<int>(r.net_flux_stellar.size()) != nlay + 1)
+      continue;
+
+    double scale = 0.0;
+    for (int l = 0; l <= nlay; ++l)
+      scale = std::max(scale, std::abs(r.flux_up[l] - r.flux_down[l] - r.flux_direct[l]));
+
+    for (int l = 0; l <= nlay; ++l) {
+      double total = r.flux_up[l] - r.flux_down[l] - r.flux_direct[l];
+      double recon = r.net_flux_thermal[l] + r.net_flux_stellar[l];
+      EXPECT_NEAR(recon, total, 1e-10 * (scale + 1e-300));
+    }
+  }
+}
+
+TEST(ADSolver, FluxComponentsMatchSuperposition) {
+  // The in-solve split must equal an independent thermal-only and solar-only
+  // solve (the diffuse field is linear in the sources at frozen opacity).
+  for (int nq : {8, 6}) {
+    int nlay = 20;
+    adrt::ADConfig both = makeSplitConfig(nlay, nq);
+    both.compute_flux_components = true;
+    auto rb = adrt::solve(both);
+
+    adrt::ADConfig th = makeSplitConfig(nlay, nq);   // thermal only
+    th.solar_flux = 0.0;
+    auto rt = adrt::solve(th);
+
+    adrt::ADConfig so = makeSplitConfig(nlay, nq);   // solar only
+    so.use_thermal_emission = false;
+    for (auto& t : so.temperature) t = 0.0;
+    auto rs = adrt::solve(so);
+
+    double scale = 0.0;
+    for (int l = 0; l <= nlay; ++l)
+      scale = std::max(scale, std::abs(rt.flux_up[l] - rt.flux_down[l])
+                            + std::abs(rs.flux_up[l] - rs.flux_down[l] - rs.flux_direct[l]));
+
+    for (int l = 0; l <= nlay; ++l) {
+      double th_total = rt.flux_up[l] - rt.flux_down[l] - rt.flux_direct[l];
+      double so_total = rs.flux_up[l] - rs.flux_down[l] - rs.flux_direct[l];
+      EXPECT_NEAR(rb.net_flux_thermal[l], th_total, 1e-10 * (scale + 1e-300));
+      EXPECT_NEAR(rb.net_flux_stellar[l], so_total, 1e-10 * (scale + 1e-300));
+    }
+  }
+}
+
+TEST(ADSolver, FluxComponentsThermalOnlyHasZeroStellar) {
+  // With no solar source the stellar component is identically zero and the
+  // thermal component is the full net flux.
+  int nlay = 20;
+  adrt::ADConfig cfg = makeSplitConfig(nlay, 8);
+  cfg.solar_flux = 0.0;
+  cfg.compute_flux_components = true;
+  auto r = adrt::solve(cfg);
+
+  for (int l = 0; l <= nlay; ++l) {
+    EXPECT_EQ(r.net_flux_stellar[l], 0.0);
+    EXPECT_NEAR(r.net_flux_thermal[l], r.flux_up[l] - r.flux_down[l], 1e-12);
+  }
+}
+
+TEST(ADSolver, FluxComponentsDisabledByDefault) {
+  // The split arrays stay empty unless requested (default path untouched).
+  adrt::ADConfig cfg = makeSplitConfig(10, 8);
+  auto r = adrt::solve(cfg);
+  EXPECT_TRUE(r.net_flux_thermal.empty());
+  EXPECT_TRUE(r.net_flux_stellar.empty());
+}
+
+
+// ============================================================================
 //  Regression: Mixed atmosphere (thermal + solar, mixed phase functions)
 // ============================================================================
 

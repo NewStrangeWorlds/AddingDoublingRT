@@ -27,7 +27,8 @@ static typename Matrix<N>::EigenVec computeIup(
   const LayerMatrices<N>& base,
   const typename Matrix<N>::EigenVec& I_top_down,
   const typename Matrix<N>::EigenVec& I_bot_up,
-  Eigen::PartialPivLU<typename Matrix<N>::EigenMat>* lu_out = nullptr)
+  Eigen::PartialPivLU<typename Matrix<N>::EigenMat>* lu_out = nullptr,
+  typename Matrix<N>::EigenVec* I_up_stellar = nullptr)
 {
   using Vec = typename Matrix<N>::EigenVec;
 
@@ -42,7 +43,21 @@ static typename Matrix<N>::EigenVec computeIup(
 
   Vec rhs = term1 + term2 + term3 + base.s_up + base.s_up_solar;
 
-  if (lu_out) { lu_out->compute(to_invert.eigen()); return lu_out->solve(rhs); }
+  // Stellar/thermal split: the diffuse field is linear in the sources, and the
+  // boundary intensities (I_top_down, I_bot_up) are thermal, so the stellar-only
+  // upward intensity is driven by the solar source terms alone. Reuse the same
+  // factorisation for the second solve.
+  if (lu_out || I_up_stellar) {
+    Eigen::PartialPivLU<typename Matrix<N>::EigenMat> local_lu;
+    auto* lu = lu_out ? lu_out : &local_lu;
+    lu->compute(to_invert.eigen());
+    Vec result = lu->solve(rhs);
+    if (I_up_stellar) {
+      Vec rhs_solar = base.R_ab.multiply(top.s_down_solar) + base.s_up_solar;
+      *I_up_stellar = lu->solve(rhs_solar);
+    }
+    return result;
+  }
   return to_invert.solve(rhs);
 }
 
@@ -53,7 +68,8 @@ static typename Matrix<N>::EigenVec computeIdown(
   const LayerMatrices<N>& base,
   const typename Matrix<N>::EigenVec& I_top_down,
   const typename Matrix<N>::EigenVec& I_bot_up,
-  Eigen::PartialPivLU<typename Matrix<N>::EigenMat>* lu_out = nullptr)
+  Eigen::PartialPivLU<typename Matrix<N>::EigenMat>* lu_out = nullptr,
+  typename Matrix<N>::EigenVec* I_down_stellar = nullptr)
 {
   using Vec = typename Matrix<N>::EigenVec;
 
@@ -68,7 +84,19 @@ static typename Matrix<N>::EigenVec computeIdown(
 
   Vec rhs = term1 + term2 + term3 + top.s_down + top.s_down_solar;
 
-  if (lu_out) { lu_out->compute(to_invert.eigen()); return lu_out->solve(rhs); }
+  // Stellar/thermal split (see computeIup): the stellar-only downward intensity
+  // is driven by the solar sources alone; reuse the factorisation.
+  if (lu_out || I_down_stellar) {
+    Eigen::PartialPivLU<typename Matrix<N>::EigenMat> local_lu;
+    auto* lu = lu_out ? lu_out : &local_lu;
+    lu->compute(to_invert.eigen());
+    Vec result = lu->solve(rhs);
+    if (I_down_stellar) {
+      Vec rhs_solar = top.R_ba.multiply(base.s_up_solar) + top.s_down_solar;
+      *I_down_stellar = lu->solve(rhs_solar);
+    }
+    return result;
+  }
   return to_invert.solve(rhs);
 }
 
@@ -612,12 +640,23 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
   result.flux_divergence.resize(n_interfaces, 0.0);
   result.flux_direct.resize(n_interfaces, 0.0);
 
-  if (cfg.solar_flux > 0.0 && cfg.solar_mu > 0.0) 
+  // Optional thermal/stellar net-flux split. Stellar diffuse fluxes are
+  // accumulated separately; thermal = total - stellar (see below). Skip the
+  // extra solves when there is no stellar source (split is then trivial).
+  const bool want_components = cfg.compute_flux_components;
+  const bool split_solar = want_components && has_solar;
+  std::vector<double> flux_up_stellar, flux_down_stellar;
+  if (want_components) {
+    flux_up_stellar.assign(n_interfaces, 0.0);
+    flux_down_stellar.assign(n_interfaces, 0.0);
+  }
+
+  if (cfg.solar_flux > 0.0 && cfg.solar_mu > 0.0)
   {
     double tau_cum = 0.0;
     result.flux_direct[0] = cfg.solar_flux * cfg.solar_mu;
-    
-    for (int l = 0; l < nlay; ++l) 
+
+    for (int l = 0; l < nlay; ++l)
     {
       tau_cum += tau_used[l];
       result.flux_direct[l + 1] = cfg.solar_flux * cfg.solar_mu
@@ -632,12 +671,18 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
     Vec Tbot = full.T_ba.multiply(I_bot_up);
     Iup += Tbot + full.s_up + full.s_up_solar;
 
-    for (int i = 0; i < N; ++i) 
+    for (int i = 0; i < N; ++i)
     {
       result.flux_up[0]        += 2.0 * PI * wt[i] * mu[i] * Iup[i];
       result.flux_down[0]      += 2.0 * PI * wt[i] * mu[i] * I_top_down[i];
       result.mean_intensity[0] += 0.5 * wt[i] * (Iup[i] + I_top_down[i]);
     }
+
+    // Stellar Iup at TOA is the solar source alone (boundaries are thermal);
+    // stellar Idown at TOA is zero (I_top_down is thermal).
+    if (split_solar)
+      for (int i = 0; i < N; ++i)
+        flux_up_stellar[0] += 2.0 * PI * wt[i] * mu[i] * full.s_up_solar[i];
   }
 
   // Internal interfaces
@@ -647,14 +692,19 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
     int n_base = ltot - l;
 
     Vec Iup, Idown;
+    Vec Iup_solar, Idown_solar;
+    bool have_solar_split = false;
 
     if (n_base > 0 && n_top > 0)
     {
       Iup   = computeIup<N>(rtop[n_top], rbase[n_base], I_top_down, I_bot_up,
-                            want_jac ? &jcache.iface_up_lu[l] : nullptr);
+                            want_jac ? &jcache.iface_up_lu[l] : nullptr,
+                            split_solar ? &Iup_solar : nullptr);
       Idown = computeIdown<N>(rtop[n_top], rbase[n_base], I_top_down, I_bot_up,
-                              want_jac ? &jcache.iface_dn_lu[l] : nullptr);
+                              want_jac ? &jcache.iface_dn_lu[l] : nullptr,
+                              split_solar ? &Idown_solar : nullptr);
       if (want_jac) jcache.iface_has[l] = 1;
+      have_solar_split = split_solar;
     }
     else if (n_base == 0)
     {
@@ -662,19 +712,34 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
       Vec RtopIbot = rtop[n_top].R_ba.multiply(I_bot_up);
       Idown += RtopIbot + rtop[n_top].s_down + rtop[n_top].s_down_solar;
       Iup = I_bot_up;
+
+      if (split_solar)
+      {
+        // Boundaries are thermal: stellar Iup = 0, stellar Idown = solar source.
+        Iup_solar = Vec::Zero();
+        Idown_solar = rtop[n_top].s_down_solar;
+        have_solar_split = true;
+      }
     }
-    else 
+    else
     {
       Iup = Vec::Zero();
       Idown = I_top_down;
     }
 
-    for (int i = 0; i < N; ++i) 
+    for (int i = 0; i < N; ++i)
     {
       result.flux_up[l]        += 2.0 * PI * wt[i] * mu[i] * Iup[i];
       result.flux_down[l]      += 2.0 * PI * wt[i] * mu[i] * Idown[i];
       result.mean_intensity[l] += 0.5 * wt[i] * (Iup[i] + Idown[i]);
     }
+
+    if (have_solar_split)
+      for (int i = 0; i < N; ++i)
+      {
+        flux_up_stellar[l]   += 2.0 * PI * wt[i] * mu[i] * Iup_solar[i];
+        flux_down_stellar[l] += 2.0 * PI * wt[i] * mu[i] * Idown_solar[i];
+      }
   }
 
   // Add the direct (stellar) beam contribution so that mean_intensity is the
@@ -699,6 +764,23 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
                                 * (result.mean_intensity[l] - B[l]);
   }
 
+  // Thermal/stellar net-flux split (filled on request). The diffuse field is
+  // linear in the sources at frozen opacity and the boundaries are thermal, so
+  // the stellar-only diffuse flux is driven by the solar sources alone and
+  // thermal = total - stellar. The direct beam is wholly stellar (downward).
+  if (want_components)
+  {
+    result.net_flux_thermal.assign(n_interfaces, 0.0);
+    result.net_flux_stellar.assign(n_interfaces, 0.0);
+    for (int l = 0; l < n_interfaces; ++l)
+    {
+      double net_stellar_diffuse = flux_up_stellar[l] - flux_down_stellar[l];
+      result.net_flux_stellar[l] = net_stellar_diffuse - result.flux_direct[l];
+      result.net_flux_thermal[l] =
+          (result.flux_up[l] - result.flux_down[l]) - net_stellar_diffuse;
+    }
+  }
+
   // --- 9. Analytic temperature Jacobians (optional) ---
   // Done before the index_from_bottom reversal; the routine handles its own
   // axis reversal for the Jacobian arrays.
@@ -716,6 +798,10 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
     std::reverse(result.mean_intensity.begin(), result.mean_intensity.end());
     std::reverse(result.flux_divergence.begin(), result.flux_divergence.end());
     std::reverse(result.flux_direct.begin(), result.flux_direct.end());
+    if (want_components) {
+      std::reverse(result.net_flux_thermal.begin(), result.net_flux_thermal.end());
+      std::reverse(result.net_flux_stellar.begin(), result.net_flux_stellar.end());
+    }
   }
 
   return result;
@@ -1539,12 +1625,21 @@ static RTOutput solveDynamic(
   result.flux_divergence.resize(n_interfaces, 0.0);
   result.flux_direct.resize(n_interfaces, 0.0);
 
-  if (cfg.solar_flux > 0.0 && cfg.solar_mu > 0.0) 
+  // Optional thermal/stellar net-flux split (see solveImpl<N> for the rationale).
+  const bool want_components = cfg.compute_flux_components;
+  const bool split_solar = want_components && has_solar;
+  std::vector<double> flux_up_stellar, flux_down_stellar;
+  if (want_components) {
+    flux_up_stellar.assign(n_interfaces, 0.0);
+    flux_down_stellar.assign(n_interfaces, 0.0);
+  }
+
+  if (cfg.solar_flux > 0.0 && cfg.solar_mu > 0.0)
   {
     double tau_cum = 0.0;
     result.flux_direct[0] = cfg.solar_flux * cfg.solar_mu;
-    
-    for (int l = 0; l < nlay; ++l) 
+
+    for (int l = 0; l < nlay; ++l)
     {
       tau_cum += tau_used[l];
       result.flux_direct[l + 1] = cfg.solar_flux * cfg.solar_mu
@@ -1559,12 +1654,16 @@ static RTOutput solveDynamic(
 
     for (int i = 0; i < nmu; ++i)
       Iup[i] += Tbot[i] + full.s_up[i] + full.s_up_solar[i];
-    
+
     for (int i = 0; i < nmu; ++i) {
       result.flux_up[0]        += 2.0 * PI * wt[i] * mu[i] * Iup[i];
       result.flux_down[0]      += 2.0 * PI * wt[i] * mu[i] * I_top_down[i];
       result.mean_intensity[0] += 0.5 * wt[i] * (Iup[i] + I_top_down[i]);
     }
+
+    if (split_solar)
+      for (int i = 0; i < nmu; ++i)
+        flux_up_stellar[0] += 2.0 * PI * wt[i] * mu[i] * full.s_up_solar[i];
   }
 
   for (int l = 1; l <= nlay; ++l) 
@@ -1572,8 +1671,10 @@ static RTOutput solveDynamic(
     int n_top = l;
     int n_base = ltot - l;
     std::vector<double> Iup, Idown;
+    std::vector<double> Iup_solar, Idown_solar;
+    bool have_solar_split = false;
 
-    if (n_base > 0 && n_top > 0) 
+    if (n_base > 0 && n_top > 0)
     {
       auto I_id = DynamicMatrix::identity(nmu);
       // computeIup
@@ -1583,17 +1684,25 @@ static RTOutput solveDynamic(
         auto t2_pre = rtop[n_top].T_ab.multiply(I_top_down);
         auto t2 = rbase[n_base].R_ab.multiply(t2_pre);
         std::vector<double> sd(nmu);
-        
-        for (int i = 0; i < nmu; ++i) 
+
+        for (int i = 0; i < nmu; ++i)
           sd[i] = rtop[n_top].s_down[i] + rtop[n_top].s_down_solar[i];
-        
+
         auto t3 = rbase[n_base].R_ab.multiply(sd);
         std::vector<double> rhs(nmu);
-        
+
         for (int i = 0; i < nmu; ++i)
           rhs[i] = t1[i] + t2[i] + t3[i] + rbase[n_base].s_up[i] + rbase[n_base].s_up_solar[i];
-        
+
         Iup = to_inv.solve(rhs);
+
+        if (split_solar) {
+          auto t3s = rbase[n_base].R_ab.multiply(rtop[n_top].s_down_solar);
+          std::vector<double> rhs_s(nmu);
+          for (int i = 0; i < nmu; ++i)
+            rhs_s[i] = t3s[i] + rbase[n_base].s_up_solar[i];
+          Iup_solar = to_inv.solve(rhs_s);
+        }
       }
       // computeIdown
       {
@@ -1602,41 +1711,63 @@ static RTOutput solveDynamic(
         auto t2_pre = rbase[n_base].T_ba.multiply(I_bot_up);
         auto t2 = rtop[n_top].R_ba.multiply(t2_pre);
         std::vector<double> su(nmu);
-        
-        for (int i = 0; i < nmu; ++i) 
+
+        for (int i = 0; i < nmu; ++i)
           su[i] = rbase[n_base].s_up[i] + rbase[n_base].s_up_solar[i];
-        
+
         auto t3 = rtop[n_top].R_ba.multiply(su);
         std::vector<double> rhs(nmu);
-        
+
         for (int i = 0; i < nmu; ++i)
           rhs[i] = t1[i] + t2[i] + t3[i] + rtop[n_top].s_down[i] + rtop[n_top].s_down_solar[i];
-        
+
         Idown = to_inv.solve(rhs);
+
+        if (split_solar) {
+          auto t3s = rtop[n_top].R_ba.multiply(rbase[n_base].s_up_solar);
+          std::vector<double> rhs_s(nmu);
+          for (int i = 0; i < nmu; ++i)
+            rhs_s[i] = t3s[i] + rtop[n_top].s_down_solar[i];
+          Idown_solar = to_inv.solve(rhs_s);
+        }
       }
+      have_solar_split = split_solar;
     }
-    else if (n_base == 0) 
+    else if (n_base == 0)
     {
       Idown = rtop[n_top].T_ab.multiply(I_top_down);
       auto RtopIbot = rtop[n_top].R_ba.multiply(I_bot_up);
 
       for (int i = 0; i < nmu; ++i)
         Idown[i] += RtopIbot[i] + rtop[n_top].s_down[i] + rtop[n_top].s_down_solar[i];
-      
+
       Iup = I_bot_up;
+
+      if (split_solar) {
+        Iup_solar.assign(nmu, 0.0);
+        Idown_solar = rtop[n_top].s_down_solar;
+        have_solar_split = true;
+      }
     }
-    else 
+    else
     {
       Iup.assign(nmu, 0.0);
       Idown = I_top_down;
     }
 
-    for (int i = 0; i < nmu; ++i) 
+    for (int i = 0; i < nmu; ++i)
     {
       result.flux_up[l]        += 2.0 * PI * wt[i] * mu[i] * Iup[i];
       result.flux_down[l]      += 2.0 * PI * wt[i] * mu[i] * Idown[i];
       result.mean_intensity[l] += 0.5 * wt[i] * (Iup[i] + Idown[i]);
     }
+
+    if (have_solar_split)
+      for (int i = 0; i < nmu; ++i)
+      {
+        flux_up_stellar[l]   += 2.0 * PI * wt[i] * mu[i] * Iup_solar[i];
+        flux_down_stellar[l] += 2.0 * PI * wt[i] * mu[i] * Idown_solar[i];
+      }
   }
 
   // Add the direct (stellar) beam contribution so that mean_intensity is the
@@ -1661,6 +1792,20 @@ static RTOutput solveDynamic(
                                 * (result.mean_intensity[l] - B[l]);
   }
 
+  // Thermal/stellar net-flux split (see solveImpl<N>).
+  if (want_components)
+  {
+    result.net_flux_thermal.assign(n_interfaces, 0.0);
+    result.net_flux_stellar.assign(n_interfaces, 0.0);
+    for (int l = 0; l < n_interfaces; ++l)
+    {
+      double net_stellar_diffuse = flux_up_stellar[l] - flux_down_stellar[l];
+      result.net_flux_stellar[l] = net_stellar_diffuse - result.flux_direct[l];
+      result.net_flux_thermal[l] =
+          (result.flux_up[l] - result.flux_down[l]) - net_stellar_diffuse;
+    }
+  }
+
   // Analytic temperature Jacobians (optional), before the index_from_bottom
   // reversal; the routine handles its own axis reversal for the Jacobian arrays.
   if (cfg.compute_temperature_jacobian &&
@@ -1678,6 +1823,10 @@ static RTOutput solveDynamic(
     std::reverse(result.mean_intensity.begin(), result.mean_intensity.end());
     std::reverse(result.flux_divergence.begin(), result.flux_divergence.end());
     std::reverse(result.flux_direct.begin(), result.flux_direct.end());
+    if (want_components) {
+      std::reverse(result.net_flux_thermal.begin(), result.net_flux_thermal.end());
+      std::reverse(result.net_flux_stellar.begin(), result.net_flux_stellar.end());
+    }
   }
 
   return result;

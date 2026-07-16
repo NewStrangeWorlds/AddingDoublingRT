@@ -36,6 +36,20 @@ struct RTOutput {
   std::vector<double> flux_divergence;  ///< Net flux divergence dF/dtau = 4pi(1-omega)(J - B) at each level (DisORT convention: each interface uses the layer above it)
   std::vector<double> flux_direct;      ///< Attenuated direct solar beam flux
 
+  /// Thermal/stellar decomposition of the net UPWARD flux, filled only when
+  /// ADConfig::compute_flux_components is set. The total net upward flux is
+  /// (flux_up - flux_down - flux_direct); these two arrays are its additive
+  /// thermal (Planck-source-driven) and stellar (solar-driven, incl. the direct
+  /// beam) parts. The split is exact: at frozen opacity the diffuse field is
+  /// linear in the sources, and the boundary intensities are thermal, so the
+  /// stellar-only diffuse flux is driven by the solar sources alone.
+  ///   net_flux_thermal[l] =  flux_up_thermal[l]  - flux_down_thermal[l]
+  ///   net_flux_stellar[l] = (flux_up_stellar[l]  - flux_down_stellar[l]) - flux_direct[l]
+  ///   net_flux_thermal + net_flux_stellar = flux_up - flux_down - flux_direct
+  /// Empty unless requested.
+  std::vector<double> net_flux_thermal;
+  std::vector<double> net_flux_stellar;
+
   /// Analytic temperature Jacobians (only filled when
   /// ADConfig::compute_temperature_jacobian is set). Each is indexed
   /// [interface][dof], where interface = 0..num_layers and dof = 0..num_layers+1:
@@ -72,6 +86,7 @@ public:
   bool use_diffusion_lower_bc = false; ///< Use diffusion approximation at lower boundary (stellar atmospheres)
   bool index_from_bottom = false;     ///< If true, user arrays indexed BOA (0) -> TOA
   bool compute_temperature_jacobian = false; ///< Compute analytic dF/dT, dJ/dT, d(divF)/dT (thermal only; fills RTOutput::*_temperature_jac)
+  bool compute_flux_components = false; ///< Split the net flux into thermal + stellar parts (fills RTOutput::net_flux_thermal / net_flux_stellar)
 
   // ======== Boundary conditions ========
   double surface_albedo = 0.0;      ///< Lambertian surface albedo [0, 1]
