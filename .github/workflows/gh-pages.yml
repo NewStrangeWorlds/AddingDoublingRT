@@ -44,8 +44,8 @@ jobs:
           path: ./docs/html
 
   deploy:
-    # Only deploy on pushes to main, not on pull request
-    if: github.ref == 'refs/heads/main'
+    # Only deploy on pushes to doc, not on pull request
+    if: github.ref == 'refs/heads/doc'
     needs: build
     runs-on: ubuntu-latest
     environment:
