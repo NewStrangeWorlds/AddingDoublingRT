@@ -259,12 +259,31 @@ __global__ void solveKernel(
   // Temporary for Legendre moments (only needed when not precomputed)
   float chi_buf[MAX_NMOM];
 
-  // Compute total optical depth (needed for surface solar beam)
+  // Delta-M scaled optical depth of layer l (same scaling as applied per layer
+  // below). The cumulative depth used for the direct-beam attenuation, the
+  // surface solar reflection and flux_direct must be the *scaled* one, as on
+  // the CPU (tau_used); mixing unscaled cumulative with scaled layer depths
+  // over-attenuated the beam by exp(-omega f tau / mu0) (3% flux error in the
+  // delta-M tests).
+  auto scaledTau = [&](int l, float t, float s) -> float {
+    if (!cfg.use_delta_m || s <= 0.0f || t <= 0.0f) return t;
+    float f;
+    if (has_precomp) {
+      f = precomp_f_trunc[l];
+    } else {
+      int nmom = cfg.nmom_max;
+      f = (nmom > two_M) ? phase_moments[w * nlay * nmom + l * nmom + two_M] : 0.0f;
+      if (!(f > 1e-12f && f < 1.0f - 1e-12f)) f = 0.0f;
+    }
+    return (1.0f - s * f) * t;
+  };
+
+  // Compute total (delta-M scaled) optical depth (surface solar beam, flux_direct)
   float tau_total = 0.0f;
   for (int l = 0; l < nlay; ++l) {
     float t, s;
     loadTauSsa(l, t, s);
-    tau_total += t;
+    tau_total += scaledTau(l, t, s);
   }
 
   // Surface layer (if applicable)
@@ -317,7 +336,7 @@ __global__ void solveKernel(
     float B_layer_bot = B_prev;
     B_prev = B_layer_top;
 
-    tau_above -= tau_layer;
+    tau_above -= scaledTau(l, tau_layer, omega_layer);   // scaled cumulative depth above layer l
 
     // Skip effectively transparent layers (avoid expensive doubling + adding)
     if (tau_layer < 1e-8f)
@@ -452,6 +471,7 @@ __global__ void solveKernel(
     float B_second_last = loadB(nlay - 1);
     float dtau_last_t, dtau_last_s;
     loadTauSsa(nlay - 1, dtau_last_t, dtau_last_s);
+    dtau_last_t = scaledTau(nlay - 1, dtau_last_t, dtau_last_s);   // delta-M scaled, as on the CPU (tau_used)
     float dB_dtau = (dtau_last_t > 0.0f) ? (B_bottom - B_second_last) / dtau_last_t : 0.0f;
     #pragma unroll
     for (int i = 0; i < N; ++i)
@@ -574,10 +594,29 @@ __global__ void solveKernelWarp(
   // Temporary for Legendre moments (only needed when not precomputed)
   float chi_buf[MAX_NMOM];
 
-  // Compute total optical depth
+  // Delta-M scaled optical depth of layer l (same scaling as applied per layer
+  // below). The cumulative depth used for the direct-beam attenuation, the
+  // surface solar reflection and flux_direct must be the *scaled* one, as on
+  // the CPU (tau_used); mixing unscaled cumulative with scaled layer depths
+  // over-attenuated the beam by exp(-omega f tau / mu0) (3% flux error in the
+  // delta-M tests).
+  auto scaledTau = [&](int l, float t, float s) -> float {
+    if (!cfg.use_delta_m || s <= 0.0f || t <= 0.0f) return t;
+    float f;
+    if (has_precomp) {
+      f = precomp_f_trunc[l];
+    } else {
+      int nmom = cfg.nmom_max;
+      f = (nmom > two_M) ? phase_moments[w * nlay * nmom + l * nmom + two_M] : 0.0f;
+      if (!(f > 1e-12f && f < 1.0f - 1e-12f)) f = 0.0f;
+    }
+    return (1.0f - s * f) * t;
+  };
+
+  // Compute total (delta-M scaled) optical depth
   float tau_total = 0.0f;
   for (int l = 0; l < nlay; ++l)
-    tau_total += delta_tau[w * nlay + l];
+    tau_total += scaledTau(l, delta_tau[w * nlay + l], single_scat_albedo[w * nlay + l]);
 
   // Surface layer
   bool has_surface = !cfg.use_diffusion_lower_bc
@@ -629,7 +668,7 @@ __global__ void solveKernelWarp(
     float B_layer_bot = B_prev;
     B_prev = B_layer_top;
 
-    tau_above -= tau_layer;
+    tau_above -= scaledTau(l, tau_layer, omega_layer);   // scaled cumulative depth above layer l
     float tau_cumulative = tau_above;
 
     // Build phase matrices (distributed: each thread loads only its row)
@@ -813,7 +852,8 @@ __global__ void solveKernelWarp(
   if (cfg.use_diffusion_lower_bc) {
     float B_bottom = loadB(nlay);
     float B_second_last = loadB(nlay - 1);
-    float dtau_last = delta_tau[w * nlay + (nlay - 1)];
+    float dtau_last = scaledTau(nlay - 1, delta_tau[w * nlay + (nlay - 1)],
+                                single_scat_albedo[w * nlay + (nlay - 1)]);   // delta-M scaled
     float dB_dtau = (dtau_last > 0.0f) ? (B_bottom - B_second_last) / dtau_last : 0.0f;
     I_bot_up = B_bottom + d_mu[row_id] * dB_dtau;
   }

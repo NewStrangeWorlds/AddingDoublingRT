@@ -2299,7 +2299,7 @@ TEST(Doubling, CountRuleIsConverged) {
       auto ref = adrt::doubling<8>(tau, omega, B_top, B_bot, fx.Ppp, fx.Ppm, fx.mu, fx.wt,
                                    F0, mu0, 0.0, &fx.p_plus, &fx.p_minus, nn + 8);
 
-      const double tol = 3e-5;
+      const double tol = 1e-5;
       for (int i = 0; i < 8; ++i) {
         EXPECT_NEAR(fluxRow<8>(L.T_ab, i, fx.mu, fx.wt), fluxRow<8>(ref.T_ab, i, fx.mu, fx.wt), tol);
         EXPECT_NEAR(fluxRow<8>(L.R_ab, i, fx.mu, fx.wt), fluxRow<8>(ref.R_ab, i, fx.mu, fx.wt), tol);
@@ -2313,7 +2313,7 @@ TEST(Doubling, CountRuleIsConverged) {
 }
 
 TEST(Doubling, StartRespectsExtinctionFloor) {
-  // tau0 = tau / 2^nn must not exceed mu_min / 2 for any omega.
+  // omega * (tau0 / mu_min)^2 must not exceed 2^(-2 * 7.6) for any omega >= 1e-8.
   for (int N : {4, 8, 16, 32}) {
     std::vector<double> mu, wt;
     adrt::gaussLegendre(N, mu, wt);
@@ -2321,7 +2321,8 @@ TEST(Doubling, StartRespectsExtinctionFloor) {
     for (double tau : {0.01, 0.1, 1.0, 5.0, 20.0, 200.0})
       for (double omega : {1e-8, 1e-3, 0.05, 0.5, 1.0}) {
         int nn = adrt::computeDoublingCount(tau, omega, mu_min);
-        EXPECT_TRUE(tau / std::pow(2.0, nn) <= 0.5 * mu_min + 1e-15);
+        double x = tau / std::pow(2.0, nn) / mu_min;
+        EXPECT_TRUE(omega * x * x <= std::pow(2.0, -2.0 * 7.6) * (1.0 + 1e-12));
         // ... and never fewer doublings than the omega rule alone.
         EXPECT_TRUE(nn >= std::max(1, static_cast<int>(std::log(tau) / std::log(2.0))
                                         + adrt::computeIpow0(omega)));

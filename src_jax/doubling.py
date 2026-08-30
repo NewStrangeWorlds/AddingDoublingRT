@@ -16,11 +16,13 @@ def _compute_ipow0(omega):
     return 16
 
 
-def compute_doubling_count(tau, omega, mu_min):
-    """Number of doublings: omega-adaptive rule plus the extinction floor
-    tau0 = tau / 2**nn <= mu_min / 2 (mirrors adrt::computeDoublingCount)."""
+def compute_doubling_count(tau, omega, mu_min, floor_const=7.6):
+    """Number of doublings: omega-adaptive rule plus the omega-scaled extinction
+    floor nn >= log2(tau/mu_min) + 0.5*log2(omega) + c (mirrors
+    adrt::computeDoublingCount). The start error scales as omega*(tau0/mu_min)**2,
+    so this keeps it below ~2**(-2c) uniformly in (tau, omega)."""
     nn = int(np.log(tau) / np.log(2.0)) + _compute_ipow0(omega)
-    n_ext = int(np.ceil(np.log2(tau / mu_min))) + 1
+    n_ext = int(np.ceil(np.log2(tau / mu_min) + 0.5 * np.log2(max(omega, 1e-8)) + floor_const))
     return max(1, nn, n_ext)
 
 
@@ -50,8 +52,8 @@ def doubling_start(tau0, omega, Spp, Spm, mu,
     Exact extinction e_i = exp(-tau0/mu_i), exact single scattering, Taylor
     double scattering tau0^2/2 * S^2, and a thermal source consistent with the
     absorbed fraction of the operators (Kirchhoff) through O(tau0^2):
-        y_i = (1-omega) [ (1-e_i) + tau0^2/2 sum_k (Spp+Spm)_ik / mu_k ].
-    Extinction and single scattering are exact for any tau0/mu, so the start
+        y_i = (1-omega) [ (1-e_i) + tau0^2/2 sum_k (Spp+Spm)_ik / mu_k ],
+    so that sum_j (T+R)_ij + y_i = 1 + O((tau0/mu_min)^3). Extinction and single scattering are exact for any tau0/mu, so the start
     never leaves the physical range (the former first-order start
     T = I - tau0*Gpp blew up under doubling for tau0 > mu_min).
 

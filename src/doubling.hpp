@@ -31,20 +31,30 @@ inline int computeIpow0(double omega)
 ///
 /// Two criteria are combined:
 ///   1. the omega-adaptive multiple-scattering criterion, ipow0(omega) + log2(tau);
-///   2. an extinction floor, tau0 = tau / 2^nn <= mu_min / 2, which keeps the
-///      Taylor-expanded double-scattering terms of the start (polynomial in
-///      omega*tau0/mu) inside their convergence regime. Without it, thick and
-///      weakly scattering layers (small ipow0) would start from tau0 >> mu_min.
+///   2. an omega-scaled extinction floor. The truncation error of the
+///      thin-layer start scales as omega * (tau0/mu_min)^2 (the only
+///      polynomial terms are the Taylor double-scattering terms, which carry
+///      a factor omega), so a uniform tolerance tol = 2^(-2 c) requires
+///        tau0/mu_min <= sqrt(tol/omega)
+///        <=> nn >= log2(tau/mu_min) + 0.5*log2(omega) + c.
+///      With c = 7.6 the start error stays below ~1e-5 everywhere on the
+///      (tau, omega) plane, including omega just below the ipow0 = 4 branch
+///      boundary, and the count varies continuously across that boundary.
+///      omega is clamped from below at 1e-8 so the floor never vanishes.
 ///
-/// The three ipow0 values can be overridden (the CUDA backends use smaller ones).
+/// The three ipow0 values and the floor constant can be overridden (the CUDA
+/// backends use smaller values, matching their single-precision accuracy).
 inline int computeDoublingCount(
   double tau, double omega, double mu_min,
-  int ipow0_weak = 4, int ipow0_mid = 10, int ipow0_strong = 16)
+  int ipow0_weak = 4, int ipow0_mid = 10, int ipow0_strong = 16,
+  double floor_const = 7.6)
 {
   int ipow0 = (omega < 0.01) ? ipow0_weak : (omega < 0.1) ? ipow0_mid : ipow0_strong;
   int nn = static_cast<int>(std::log(tau) / std::log(2.0)) + ipow0;
 
-  int n_ext = static_cast<int>(std::ceil(std::log2(tau / mu_min))) + 1;
+  const double om = std::max(omega, 1e-8);
+  int n_ext = static_cast<int>(std::ceil(std::log2(tau / mu_min)
+                                         + 0.5 * std::log2(om) + floor_const));
 
   return std::max({1, nn, n_ext});
 }
@@ -87,7 +97,7 @@ inline double doublingPathIntegral(double tau0, double d, double e_i, double e_j
 /// The thermal source is the absorbed fraction of the same operators
 /// (Kirchhoff), consistent through O(tau0^2):
 ///   y_i = (1-omega) * [ (1 - e_i) + tau0^2/2 * sum_k (Spp+Spm)(i,k) / mu_k ]
-/// so that sum_j (T+R)(i,j) + y_i = 1 + O(tau0^3) and y == 0 for omega = 1.
+/// so that sum_j (T+R)(i,j) + y_i = 1 + O((tau0/mu_min)^3) and y == 0 for omega = 1.
 /// z (the linear-in-tau source gradient term) is the pure-absorption value,
 /// O(tau0^3). The solar source uses the same exact-single + Taylor-double
 /// treatment with the direct beam attenuated along its own path.

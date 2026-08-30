@@ -481,8 +481,9 @@ class BatchConfig:
 def _compute_nn_layers(delta_tau, ssa, mu_min):
     """Per-(wavenumber, layer) doubling counts, shape (nwav, nlay), int32.
 
-    Omega-adaptive rule plus the extinction floor tau0 = tau / 2**nn <= mu_min / 2
-    (mirrors adrt::computeDoublingCount). Non-scattering or empty entries get 1:
+    Omega-adaptive rule plus the omega-scaled extinction floor
+    nn >= log2(tau/mu_min) + 0.5*log2(omega) + 7.6 (mirrors
+    adrt::computeDoublingCount). Non-scattering or empty entries get 1:
     the thin-layer start is exact for omega = 0 at any tau0.
     """
     tau = np.asarray(delta_tau, dtype=np.float64)
@@ -491,7 +492,8 @@ def _compute_nn_layers(delta_tau, ssa, mu_min):
     tau_s = np.where(mask, tau, 1.0)
     ipow0 = np.where(omega < 0.01, 4, np.where(omega < 0.1, 10, 16))
     nn = np.floor(np.log2(tau_s)).astype(int) + ipow0
-    n_ext = np.ceil(np.log2(tau_s / mu_min)).astype(int) + 1
+    n_ext = np.ceil(np.log2(tau_s / mu_min)
+                    + 0.5 * np.log2(np.maximum(omega, 1e-8)) + 7.6).astype(int)
     nn = np.maximum(1, np.maximum(nn, n_ext))
     return np.where(mask, nn, 1).astype(np.int32)
 

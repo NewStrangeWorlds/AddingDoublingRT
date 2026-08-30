@@ -891,8 +891,10 @@ __global__ void batchedComputeTau0Kernel(
 }
 
 /// Compute nn_max across all wavenumbers (host-side reduction helper).
-/// Mirrors adrt::computeDoublingCount with the GPU ipow0 values (2, 8, 12):
-/// omega-adaptive rule plus the extinction floor tau0 = tau / 2^nn <= mu_min / 2.
+/// Mirrors adrt::computeDoublingCount with the GPU ipow0 values (2, 8, 12) and
+/// the omega-scaled extinction floor nn >= log2(tau/mu_min) + 0.5*log2(omega) + 6.6,
+/// capped at the strong-scattering count log2(tau) + 12 (float32 round-off grows
+/// as ~2^nn * eps; see compute_doubling_count in cuda_doubling.cuh).
 inline int computeNnMax(const std::vector<float>& tau_host,
                         const std::vector<float>& omega_host,
                         int nwav, float mu_min)
@@ -908,8 +910,11 @@ inline int computeNnMax(const std::vector<float>& tau_host,
     else if (om < 0.1f) ipow0 = 8;
     else ipow0 = 12;
 
-    int nn = static_cast<int>(logf(t) / logf(2.0f)) + ipow0;
-    int n_ext = static_cast<int>(ceilf(log2f(t / mu_min))) + 1;
+    int log2tau = static_cast<int>(logf(t) / logf(2.0f));
+    int nn = log2tau + ipow0;
+    float om_c = std::max(om, 1e-8f);
+    int n_ext = static_cast<int>(ceilf(log2f(t / mu_min) + 0.5f * log2f(om_c) + 6.6f));
+    n_ext = std::min(n_ext, log2tau + 12);
     nn = std::max(1, std::max(nn, n_ext));
     if (nn > nn_max) nn_max = nn;
   }
@@ -1003,6 +1008,8 @@ __global__ void batchedBoundaryIntensityKernel(
     const float* __restrict__ per_wav_top_emission,     // [nwav] or nullptr
     const float* __restrict__ per_wav_surface_emission, // [nwav] or nullptr
     const float* __restrict__ delta_tau,                // [nwav * nlay]
+    const float* __restrict__ ssa,                      // [nwav * nlay]
+    const float* __restrict__ f_trunc_last,             // [1] delta-M f of the bottom layer, or nullptr
     int nlay,
     const float* __restrict__ mu,   // [N]
     float* __restrict__ I_top_down, // [nwav * N]
@@ -1033,6 +1040,10 @@ __global__ void batchedBoundaryIntensityKernel(
     float B_bottom = B_levels[w * nlev + nlay];
     float B_second_last = B_levels[w * nlev + nlay - 1];
     float dtau_last = delta_tau[w * nlay + (nlay - 1)];
+    if (f_trunc_last != nullptr) {                       // delta-M scaled, as on the CPU (tau_used)
+      float f = f_trunc_last[0], om = ssa[w * nlay + (nlay - 1)];
+      if (f > 0.0f && om > 0.0f && dtau_last > 0.0f) dtau_last *= (1.0f - om * f);
+    }
     float dB_dtau = (dtau_last > 0.0f) ? (B_bottom - B_second_last) / dtau_last : 0.0f;
     I_bot_up[idx] = B_bottom + mu[i] * dB_dtau;
   } else if (!has_surface) {

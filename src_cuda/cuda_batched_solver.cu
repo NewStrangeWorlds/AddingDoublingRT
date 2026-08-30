@@ -712,16 +712,27 @@ __global__ void batchedComputeBBarBdKernel(
 //  Compute total optical depth per wavenumber
 // ============================================================================
 
+/// Total optical depth per wavenumber, delta-M scaled when f_trunc != nullptr
+/// (the cumulative depth for the direct beam / surface reflection / flux_direct
+/// must be the scaled one, consistent with the scaled layers; see CPU tau_used).
 __global__ void batchedComputeTauTotalKernel(
     int nwav, int nlay,
     const float* __restrict__ delta_tau,  // [nwav * nlay]
+    const float* __restrict__ ssa,        // [nwav * nlay]
+    const float* __restrict__ f_trunc,    // [nlay] or nullptr (no delta-M)
     float* __restrict__ tau_total)        // [nwav]
 {
   int w = blockIdx.x * blockDim.x + threadIdx.x;
   if (w >= nwav) return;
   float sum = 0.0f;
-  for (int l = 0; l < nlay; ++l)
-    sum += delta_tau[w * nlay + l];
+  for (int l = 0; l < nlay; ++l) {
+    float t = delta_tau[w * nlay + l];
+    if (f_trunc != nullptr) {
+      float f = f_trunc[l], om = ssa[w * nlay + l];
+      if (f > 0.0f && om > 0.0f && t > 0.0f) t *= (1.0f - om * f);
+    }
+    sum += t;
+  }
   tau_total[w] = sum;
 }
 
@@ -828,7 +839,8 @@ void solveBatchedCublas(
 
   // Compute total optical depth
   batchedComputeTauTotalKernel<<<divUp(nwav, BLOCK), BLOCK, 0, stream>>>(
-      nwav, nlay, data.delta_tau, ws.tau_total);
+      nwav, nlay, data.delta_tau, data.single_scat_albedo,
+      config.use_delta_m ? ws.phase_f_trunc : nullptr, ws.tau_total);
 
   // --- Surface layer ---
   bool has_surface = !config.use_diffusion_lower_bc
@@ -908,10 +920,6 @@ void solveBatchedCublas(
     strideExtractKernel<<<divUp(nwav, BLOCK), BLOCK, 0, stream>>>(
         nwav, nlay, l, data.single_scat_albedo, ws.omega_scaled);
 
-    // tau_above -= tau_layer (now tau_above = cumulative tau above layer l)
-    batchedSubtractTauKernel<<<divUp(nwav, BLOCK), BLOCK, 0, stream>>>(
-        nwav, ws.tau_scaled, ws.tau_above);
-
     // Apply delta-M scaling
     if (config.use_delta_m) {
       batchedDeltaMScaleKernel<<<divUp(nwav, BLOCK), BLOCK, 0, stream>>>(
@@ -920,6 +928,10 @@ void solveBatchedCublas(
           ws.tau_scaled, ws.tau_scaled,
           ws.omega_scaled, ws.omega_scaled);
     }
+
+    // tau_above -= tau_layer (scaled): cumulative scaled tau above layer l
+    batchedSubtractTauKernel<<<divUp(nwav, BLOCK), BLOCK, 0, stream>>>(
+        nwav, ws.tau_scaled, ws.tau_above);
 
     if (layer_pure_abs[l]) {
       // Analytic pure-absorption layer: T = exp(-tau/mu), R = 0, thermal source
@@ -983,7 +995,8 @@ void solveBatchedCublas(
       has_surface,
       data.top_emission,
       data.surface_emission,
-      data.delta_tau, nlay,
+      data.delta_tau, data.single_scat_albedo,
+      config.use_delta_m ? ws.phase_f_trunc + (nlay - 1) : nullptr, nlay,
       ws.d_mu_rt,
       ws.I_top_down, ws.I_bot_up);
 

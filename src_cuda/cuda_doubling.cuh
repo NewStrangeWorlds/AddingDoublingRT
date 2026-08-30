@@ -28,17 +28,28 @@ __device__ __forceinline__ int compute_ipow0(float omega) {
   return 12;
 }
 
-/// Number of doublings: omega-adaptive rule plus the extinction floor
-/// tau0 = tau / 2^nn <= mu_min / 2 (mirrors adrt::computeDoublingCount).
+/// Number of doublings: omega-adaptive rule plus the omega-scaled extinction
+/// floor nn >= log2(tau/mu_min) + 0.5*log2(omega) + c (mirrors
+/// adrt::computeDoublingCount; c = 6.6 here vs 7.6 on the CPU, i.e. a start
+/// tolerance of ~1e-4 matching single precision).
+///
+/// The floor is capped at the strong-scattering count log2(tau) + 12: the
+/// doubling squares T at every step, so in single precision the round-off
+/// error grows as ~2^nn * eps and exceeds the start's truncation error beyond
+/// ~14 steps. Uncapped, the floor pushed N = 16 layers with omega >= 0.5 to
+/// 17 doublings and *degraded* the flux from <5e-4 to 1e-3 relative.
 template<int N>
 __device__ __forceinline__ int compute_doubling_count(float tau, float omega) {
-  int nn = static_cast<int>(logf(tau) / logf(2.0f)) + compute_ipow0(omega);
+  int log2tau = static_cast<int>(logf(tau) / logf(2.0f));
+  int nn = log2tau + compute_ipow0(omega);
 
   float mu_min = d_mu[0];
   #pragma unroll
   for (int i = 1; i < N; ++i) mu_min = fminf(mu_min, d_mu[i]);
 
-  int n_ext = static_cast<int>(ceilf(log2f(tau / mu_min))) + 1;
+  float om = fmaxf(omega, 1e-8f);
+  int n_ext = static_cast<int>(ceilf(log2f(tau / mu_min) + 0.5f * log2f(om) + 6.6f));
+  n_ext = min(n_ext, log2tau + 12);
 
   return max(1, max(nn, n_ext));
 }

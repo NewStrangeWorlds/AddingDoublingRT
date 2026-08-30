@@ -87,6 +87,8 @@ public:
   bool index_from_bottom = false;     ///< If true, user arrays indexed BOA (0) -> TOA
   bool compute_temperature_jacobian = false; ///< Compute analytic dF/dT, dJ/dT, d(divF)/dT (thermal only; fills RTOutput::*_temperature_jac)
   bool compute_flux_components = false; ///< Split the net flux into thermal + stellar parts (fills RTOutput::net_flux_thermal / net_flux_stellar)
+  double temperature_jacobian_tau_band = 40.0; ///< Optical-depth band of the temperature Jacobian: a DOF whose adjacent layers are separated from an interface by more than this effective absorption depth (sum of delta_tau * min(1, sqrt(3(1-w)(1-w g)))) is dropped (entry left 0). exp(-40) ~ 4e-18, i.e. below double round-off; <= 0 disables banding. Reduces the O(L^2) sweep cost to O(L * band-width). Values small enough to change entries above round-off make the Jacobian inconsistent with the residual (bad for Newton solvers).
+  bool flux_divergence_omega_average = false; ///< Experimental: evaluate the (1 - omega) prefactor of flux_divergence (and its Jacobian) with the interface-averaged albedo 0.5*(omega[k-1] + omega[k]) instead of the layer above interface k. Symmetric stencil across albedo jumps (cloud edges); the default keeps the historical one-sided convention.
 
   // ======== Boundary conditions ========
   double surface_albedo = 0.0;      ///< Lambertian surface albedo [0, 1]

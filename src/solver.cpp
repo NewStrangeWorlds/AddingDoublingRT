@@ -17,6 +17,21 @@
 
 namespace adrt {
 
+/// Single-scattering albedo attributed to interface k in the flux-divergence
+/// prefactor 4 pi (1 - omega) (J - B). Historical convention: the layer above
+/// interface k (layer 0 for the TOA). With flux_divergence_omega_average the
+/// two adjacent layers are averaged, which makes the stencil symmetric where
+/// omega jumps between layers.
+static double fluxDivergenceOmega(const ADConfig& cfg, int k, int nlay)
+{
+  if (cfg.flux_divergence_omega_average) {
+    if (k == 0)    return cfg.single_scat_albedo[0];
+    if (k >= nlay) return cfg.single_scat_albedo[nlay - 1];
+    return 0.5 * (cfg.single_scat_albedo[k - 1] + cfg.single_scat_albedo[k]);
+  }
+  return cfg.single_scat_albedo[(k == 0) ? 0 : k - 1];
+}
+
 // ============================================================================
 //  Internal intensity computation (fixed-size)
 // ============================================================================
@@ -149,6 +164,8 @@ static void computeTemperatureJacobian(
     const std::vector<double>& mu,
     const std::vector<double>& wt,
     const std::vector<double>& tau_used,
+    const std::vector<double>& omega_used,
+    const std::vector<double>& g_used,
     const std::vector<LayerMatrices<N>>& layer_rtj,
     const std::vector<LayerMatrices<N>>& rbase,
     const std::vector<LayerMatrices<N>>& rtop,
@@ -171,6 +188,44 @@ static void computeTemperatureJacobian(
       has_surface && (thermal ? (cfg.surface_temperature >= 0.0)
                               : (static_cast<int>(cfg.planck_levels.size()) == nlay + 1));
   const int surf_col = surface_independent ? surf_dof : nlay;
+
+  // --- Column windows (see docs: "Cost, column windows and the optical-depth band") ---
+  // Structural: dRbase[l] (bottom l layers, top level t = ltot - l) is non-zero
+  // only in the columns of levels >= t; dRtop[l] (top l layers, bottom level l)
+  // only in the columns of levels <= l. Tracking these windows halves the sweep
+  // cost with no approximation.
+  // Optical-depth band: DOF m enters through the emission of its two adjacent
+  // layers (with the linear-in-tau source the coupling to the far end of a
+  // layer is O(mu/dtau), not exponentially small), and that emission reaches a
+  // level t only after crossing the effective absorption depth between the
+  // near edge of those layers and t. Per layer dteff = dtau * min(1,
+  // sqrt(3 (1-w)(1-w g))): the Eddington decay rate, so a conservative
+  // scattering deck (transmission ~1/tau, not exp(-tau)) never truncates,
+  // while for absorption the true rate 1/mu >= 1 is at least as fast. Entries
+  // beyond band = temperature_jacobian_tau_band are < exp(-band) relative and
+  // are left zero; the default 40 is below double round-off.
+  const double band = cfg.temperature_jacobian_tau_band;
+  std::vector<double> teff(nlay + 1, 0.0);
+  for (int l = 0; l < nlay; ++l) {
+    const double w = std::clamp(omega_used[l], 0.0, 1.0);
+    const double g = std::clamp(g_used[l], -1.0, 1.0);
+    const double rate = std::min(1.0, std::sqrt(std::max(0.0, 3.0 * (1.0 - w) * (1.0 - w * g))));
+    teff[l + 1] = teff[l] + tau_used[l] * rate;
+  }
+  // hiCol[t]: last active column for a composite whose top is level t.
+  // loCol[t]: first active column for a composite whose bottom is level t.
+  // Level m is active if its adjacent layers' near edge (level m-1 below t,
+  // m+1 above t) lies within the band. The surface DOF (column surf_dof) sits
+  // at level nlay and is active whenever level nlay is.
+  std::vector<int> hiCol(nlay + 1), loCol(nlay + 1);
+  for (int t = 0; t <= nlay; ++t) {
+    int m = t;
+    while (m < nlay && (band <= 0.0 || teff[std::max(m, t)] - teff[t] <= band)) ++m;
+    hiCol[t] = (m == nlay) ? ndof - 1 : m;
+    int q = t;
+    while (q > 0 && (band <= 0.0 || teff[t] - teff[std::min(q, t)] <= band)) --q;
+    loCol[t] = q;
+  }
 
   // --- Per-layer source-derivative seeds ------------------------------------
   // Atmospheric layer j (0..nlay-1) feeds columns j, j+1; the surface feeds
@@ -198,21 +253,23 @@ static void computeTemperatureJacobian(
   // T_ba_D1 = top.T_ba * A1^{-1} and T_bc_D2 = bot.T_ab * A2^{-1}, so the inverse
   // is applied first and T is left-multiplied afterwards. For non-scattering
   // steps A1 = A2 = E (ops.general == false) and the solve is skipped.
+  // Only the active column window [lo, lo + w) is computed; dU_ans/dD_ans are
+  // zero-initialised by the caller so the columns outside stay zero.
   auto addSourcesLin = [&](const LayerMatrices<N>& top, const LayerMatrices<N>& bot,
                            const AddStepOps<N>& ops,
                            const Block& dU_top, const Block& dD_top,
                            const Block& dU_bot, const Block& dD_bot,
-                           Block& dU_ans, Block& dD_ans) {
+                           Block& dU_ans, Block& dD_ans, int lo, int w) {
     const EMat& Rab_bot = bot.R_ab.eigen();
     const EMat& Rba_top = top.R_ba.eigen();
-    Block tmpU = dU_bot + Rab_bot * dD_top;
-    Block tmpD = dD_top + Rba_top * dU_bot;
+    Block tmpU = dU_bot.middleCols(lo, w) + Rab_bot * dD_top.middleCols(lo, w);
+    Block tmpD = dD_top.middleCols(lo, w) + Rba_top * dU_bot.middleCols(lo, w);
     if (ops.general) {
-      dU_ans = dU_top + top.T_ba.eigen() * ops.lu1.solve(tmpU);
-      dD_ans = dD_bot + bot.T_ab.eigen() * ops.lu2.solve(tmpD);
+      dU_ans.middleCols(lo, w) = dU_top.middleCols(lo, w) + top.T_ba.eigen() * ops.lu1.solve(tmpU);
+      dD_ans.middleCols(lo, w) = dD_bot.middleCols(lo, w) + bot.T_ab.eigen() * ops.lu2.solve(tmpD);
     } else {
-      dU_ans = dU_top + top.T_ba.eigen() * tmpU;   // A1 = E
-      dD_ans = dD_bot + bot.T_ab.eigen() * tmpD;   // A2 = E
+      dU_ans.middleCols(lo, w) = dU_top.middleCols(lo, w) + top.T_ba.eigen() * tmpU;   // A1 = E
+      dD_ans.middleCols(lo, w) = dD_bot.middleCols(lo, w) + bot.T_ab.eigen() * tmpD;   // A2 = E
     }
   };
 
@@ -222,21 +279,24 @@ static void computeTemperatureJacobian(
   std::vector<Block> dRbase_up(ltot + 1, zero_block), dRbase_dn(ltot + 1, zero_block);
   seedLayer(ltot - 1, dRbase_up[1], dRbase_dn[1]);
   for (int l = 1; l < ltot; ++l) {
-    int k = ltot - 1 - l;
+    int k = ltot - 1 - l;                     // layer added on top; composite top level = k
     Block su(N, ndof), sd(N, ndof);
     seedLayer(k, su, sd);
+    const int lo = k, w = hiCol[k] - lo + 1;
     addSourcesLin(layer_rtj[k], rbase[l], cache.rbase_ops[l], su, sd,
-                  dRbase_up[l], dRbase_dn[l], dRbase_up[l + 1], dRbase_dn[l + 1]);
+                  dRbase_up[l], dRbase_dn[l], dRbase_up[l + 1], dRbase_dn[l + 1], lo, w);
   }
 
   // --- Top-down sweep: dS for every rtop[l] ---------------------------------
   std::vector<Block> dRtop_up(ltot + 1, zero_block), dRtop_dn(ltot + 1, zero_block);
   seedLayer(0, dRtop_up[1], dRtop_dn[1]);
-  for (int l = 1; l < ltot; ++l) {
+  for (int l = 1; l < ltot; ++l) {           // layer l added below; composite bottom level = min(l+1, nlay)
     Block su(N, ndof), sd(N, ndof);
     seedLayer(l, su, sd);
+    const int b = std::min(l + 1, nlay);
+    const int lo = loCol[b], hi = (l + 1 <= nlay) ? l + 1 : ndof - 1, w = hi - lo + 1;
     addSourcesLin(rtop[l], layer_rtj[l], cache.rtop_ops[l], dRtop_up[l], dRtop_dn[l],
-                  su, sd, dRtop_up[l + 1], dRtop_dn[l + 1]);
+                  su, sd, dRtop_up[l + 1], dRtop_dn[l + 1], lo, w);
   }
 
   // --- Boundary-intensity derivatives ---------------------------------------
@@ -271,8 +331,8 @@ static void computeTemperatureJacobian(
   Jm.assign(n_interfaces, std::vector<double>(ndof, 0.0));
   Jdv.assign(n_interfaces, std::vector<double>(ndof, 0.0));
 
-  auto reduce = [&](int k, const Block& dIup, const Block& dIdn) {
-    for (int m = 0; m < ndof; ++m) {
+  auto reduce = [&](int k, const Block& dIup, const Block& dIdn, int lo, int w) {
+    for (int m = lo; m < lo + w; ++m) {
       double fu = 0.0, fd = 0.0, jm = 0.0;
       for (int i = 0; i < N; ++i) {
         fu += 2.0 * PI * wt[i] * mu[i] * dIup(i, m);
@@ -287,45 +347,51 @@ static void computeTemperatureJacobian(
 
   // TOA (interface 0): uses whole-atmosphere composite rbase[ltot].
   {
+    const int lo = 0, w = hiCol[0] - lo + 1;
     const auto& full = rbase[ltot];
-    Block dIup = full.R_ab.eigen() * dItop_dn + full.T_ba.eigen() * dIbot_up
-                 + dRbase_up[ltot];
-    reduce(0, dIup, dItop_dn);
+    Block dIup = full.R_ab.eigen() * dItop_dn.middleCols(lo, w)
+                 + full.T_ba.eigen() * dIbot_up.middleCols(lo, w)
+                 + dRbase_up[ltot].middleCols(lo, w);
+    Block dIup_full = Block::Zero(N, ndof);
+    dIup_full.middleCols(lo, w) = dIup;
+    reduce(0, dIup_full, dItop_dn, lo, w);
   }
 
-  // Internal interfaces.
+  // Internal interfaces: active window = union of the top composite's window
+  // [loCol[l], l] and the base composite's window [l, hiCol[l]].
   for (int l = 1; l <= nlay; ++l) {
     int n_top = l;
     int n_base = ltot - l;
-    Block dIup(N, ndof), dIdn(N, ndof);
+    const int lo = loCol[l], w = hiCol[l] - lo + 1;
+    Block dIup = Block::Zero(N, ndof), dIdn = Block::Zero(N, ndof);
 
     if (n_base > 0) {
       const auto& top  = rtop[n_top];
       const auto& base = rbase[n_base];
-      Block rhs_u = base.T_ba.eigen() * dIbot_up
-                  + base.R_ab.eigen() * (top.T_ab.eigen() * dItop_dn)
-                  + base.R_ab.eigen() * dRtop_dn[n_top]
-                  + dRbase_up[n_base];
-      dIup = cache.iface_up_lu[l].solve(rhs_u);   // cached LU of (E - base.R_ab top.R_ba)
+      Block rhs_u = base.T_ba.eigen() * dIbot_up.middleCols(lo, w)
+                  + base.R_ab.eigen() * (top.T_ab.eigen() * dItop_dn.middleCols(lo, w))
+                  + base.R_ab.eigen() * dRtop_dn[n_top].middleCols(lo, w)
+                  + dRbase_up[n_base].middleCols(lo, w);
+      dIup.middleCols(lo, w) = cache.iface_up_lu[l].solve(rhs_u);   // cached LU of (E - base.R_ab top.R_ba)
 
-      Block rhs_d = top.T_ab.eigen() * dItop_dn
-                  + top.R_ba.eigen() * (base.T_ba.eigen() * dIbot_up)
-                  + top.R_ba.eigen() * dRbase_up[n_base]
-                  + dRtop_dn[n_top];
-      dIdn = cache.iface_dn_lu[l].solve(rhs_d);   // cached LU of (E - top.R_ba base.R_ab)
+      Block rhs_d = top.T_ab.eigen() * dItop_dn.middleCols(lo, w)
+                  + top.R_ba.eigen() * (base.T_ba.eigen() * dIbot_up.middleCols(lo, w))
+                  + top.R_ba.eigen() * dRbase_up[n_base].middleCols(lo, w)
+                  + dRtop_dn[n_top].middleCols(lo, w);
+      dIdn.middleCols(lo, w) = cache.iface_dn_lu[l].solve(rhs_d);   // cached LU of (E - top.R_ba base.R_ab)
     } else {
       const auto& top = rtop[n_top];
-      dIdn = top.T_ab.eigen() * dItop_dn + top.R_ba.eigen() * dIbot_up
-             + dRtop_dn[n_top];
+      dIdn.middleCols(lo, w) = top.T_ab.eigen() * dItop_dn.middleCols(lo, w)
+                             + top.R_ba.eigen() * dIbot_up.middleCols(lo, w)
+                             + dRtop_dn[n_top].middleCols(lo, w);
       dIup = dIbot_up;
     }
-    reduce(l, dIup, dIdn);
+    reduce(l, dIup, dIdn, lo, w);
   }
 
   // --- Flux-divergence Jacobian (still B-space), Eq. (fdivjac) ---------------
   for (int k = 0; k < n_interfaces; ++k) {
-    int lyr = (k == 0) ? 0 : k - 1;
-    double pref = 4.0 * PI * (1.0 - cfg.single_scat_albedo[lyr]);
+    double pref = 4.0 * PI * (1.0 - fluxDivergenceOmega(cfg, k, nlay));
     for (int m = 0; m < ndof; ++m) {
       double dB_term = (m == k) ? 1.0 : 0.0;   // d B_k / d B_m = delta_km (levels)
       Jdv[k][m] = pref * (Jm[k][m] - dB_term);
@@ -452,7 +518,7 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
 
   std::vector<LayerMatrices<N>> layer_rtj;
   layer_rtj.reserve(nlay);
-  std::vector<double> tau_used(nlay);
+  std::vector<double> tau_used(nlay), omega_used(nlay), g_used(nlay);
 
   double tau_cumulative = 0.0;
   for (int l = 0; l < nlay; ++l) {
@@ -530,6 +596,21 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
     }
 
     tau_used[l] = tau_layer;
+    omega_used[l] = omega_layer;                 // delta-M scaled if applicable
+    {
+      double g_layer = 0.0;
+      if (omega_layer > 0.0 && tau_layer > 0.0) {
+        const auto& chi_full = cfg.phase_function_moments[l];
+        double chi1 = (chi_full.size() > 1) ? chi_full[1] : 0.0;
+        if (cfg.use_delta_m) {
+          double f_trunc = (static_cast<int>(chi_full.size()) > two_M) ? chi_full[two_M] : 0.0;
+          if (f_trunc > 1e-12 && f_trunc < 1.0 - 1e-12)
+            chi1 = (chi1 - f_trunc) / (1.0 - f_trunc);
+        }
+        g_layer = chi1;
+      }
+      g_used[l] = g_layer;                       // asymmetry parameter of the phase function used
+    }
 
     layer_rtj.push_back(
         doubling<N>(tau_layer, omega_layer,
@@ -759,8 +840,7 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
   // the UNSCALED value and J is the full actinic mean intensity finalized above.
   for (int l = 0; l < n_interfaces; ++l)
   {
-    int lyr = (l == 0) ? 0 : l - 1;
-    result.flux_divergence[l] = 4.0 * PI * (1.0 - cfg.single_scat_albedo[lyr])
+    result.flux_divergence[l] = 4.0 * PI * (1.0 - fluxDivergenceOmega(cfg, l, nlay))
                                 * (result.mean_intensity[l] - B[l]);
   }
 
@@ -787,7 +867,8 @@ static RTOutput solveImpl(const ADConfig& config, SolverWorkspace* ws)
   if (want_jac)
   {
     computeTemperatureJacobian<N>(cfg, nlay, ltot, has_surface, mu, wt,
-                                  tau_used, layer_rtj, rbase, rtop, jcache, result);
+                                  tau_used, omega_used, g_used,
+                                  layer_rtj, rbase, rtop, jcache, result);
   }
 
   // Reverse output if indexed from bottom
@@ -1181,6 +1262,8 @@ static void computeTemperatureJacobianDynamic(
     const std::vector<double>& mu,
     const std::vector<double>& wt,
     const std::vector<double>& tau_used,
+    const std::vector<double>& omega_used,
+    const std::vector<double>& g_used,
     const std::vector<DynLayerMatrices>& layer_rtj,
     const std::vector<DynLayerMatrices>& rbase,
     const std::vector<DynLayerMatrices>& rtop,
@@ -1199,6 +1282,44 @@ static void computeTemperatureJacobianDynamic(
                               : (static_cast<int>(cfg.planck_levels.size()) == nlay + 1));
   const int surf_col = surface_independent ? surf_dof : nlay;
   const Mat IdN = Mat::Identity(nmu, nmu);
+
+  // --- Column windows (see docs: "Cost, column windows and the optical-depth band") ---
+  // Structural: dRbase[l] (bottom l layers, top level t = ltot - l) is non-zero
+  // only in the columns of levels >= t; dRtop[l] (top l layers, bottom level l)
+  // only in the columns of levels <= l. Tracking these windows halves the sweep
+  // cost with no approximation.
+  // Optical-depth band: DOF m enters through the emission of its two adjacent
+  // layers (with the linear-in-tau source the coupling to the far end of a
+  // layer is O(mu/dtau), not exponentially small), and that emission reaches a
+  // level t only after crossing the effective absorption depth between the
+  // near edge of those layers and t. Per layer dteff = dtau * min(1,
+  // sqrt(3 (1-w)(1-w g))): the Eddington decay rate, so a conservative
+  // scattering deck (transmission ~1/tau, not exp(-tau)) never truncates,
+  // while for absorption the true rate 1/mu >= 1 is at least as fast. Entries
+  // beyond band = temperature_jacobian_tau_band are < exp(-band) relative and
+  // are left zero; the default 40 is below double round-off.
+  const double band = cfg.temperature_jacobian_tau_band;
+  std::vector<double> teff(nlay + 1, 0.0);
+  for (int l = 0; l < nlay; ++l) {
+    const double w = std::clamp(omega_used[l], 0.0, 1.0);
+    const double g = std::clamp(g_used[l], -1.0, 1.0);
+    const double rate = std::min(1.0, std::sqrt(std::max(0.0, 3.0 * (1.0 - w) * (1.0 - w * g))));
+    teff[l + 1] = teff[l] + tau_used[l] * rate;
+  }
+  // hiCol[t]: last active column for a composite whose top is level t.
+  // loCol[t]: first active column for a composite whose bottom is level t.
+  // Level m is active if its adjacent layers' near edge (level m-1 below t,
+  // m+1 above t) lies within the band. The surface DOF (column surf_dof) sits
+  // at level nlay and is active whenever level nlay is.
+  std::vector<int> hiCol(nlay + 1), loCol(nlay + 1);
+  for (int t = 0; t <= nlay; ++t) {
+    int m = t;
+    while (m < nlay && (band <= 0.0 || teff[std::max(m, t)] - teff[t] <= band)) ++m;
+    hiCol[t] = (m == nlay) ? ndof - 1 : m;
+    int q = t;
+    while (q > 0 && (band <= 0.0 || teff[t] - teff[std::min(q, t)] <= band)) --q;
+    loCol[t] = q;
+  }
 
   auto seedLayer = [&](int j, Mat& dU, Mat& dD) {
     dU.setZero();
@@ -1219,15 +1340,15 @@ static void computeTemperatureJacobianDynamic(
   auto addSourcesLin = [&](const DynLayerMatrices& top, const DynLayerMatrices& bot,
                            const Mat& dU_top, const Mat& dD_top,
                            const Mat& dU_bot, const Mat& dD_bot,
-                           Mat& dU_ans, Mat& dD_ans) {
+                           Mat& dU_ans, Mat& dD_ans, int lo, int w) {
     const Mat& Rab_bot = bot.R_ab.eigen();
     const Mat& Rba_top = top.R_ba.eigen();
     Mat A1 = IdN - Rab_bot * Rba_top;
     Mat A2 = IdN - Rba_top * Rab_bot;
-    Mat tmpU = dU_bot + Rab_bot * dD_top;
-    Mat tmpD = dD_top + Rba_top * dU_bot;
-    dU_ans = dU_top + top.T_ba.eigen() * A1.partialPivLu().solve(tmpU);
-    dD_ans = dD_bot + bot.T_ab.eigen() * A2.partialPivLu().solve(tmpD);
+    Mat tmpU = dU_bot.middleCols(lo, w) + Rab_bot * dD_top.middleCols(lo, w);
+    Mat tmpD = dD_top.middleCols(lo, w) + Rba_top * dU_bot.middleCols(lo, w);
+    dU_ans.middleCols(lo, w) = dU_top.middleCols(lo, w) + top.T_ba.eigen() * A1.partialPivLu().solve(tmpU);
+    dD_ans.middleCols(lo, w) = dD_bot.middleCols(lo, w) + bot.T_ab.eigen() * A2.partialPivLu().solve(tmpD);
   };
 
   const Mat zero_block = Mat::Zero(nmu, ndof);
@@ -1238,8 +1359,9 @@ static void computeTemperatureJacobianDynamic(
     int k = ltot - 1 - l;
     Mat su(nmu, ndof), sd(nmu, ndof);
     seedLayer(k, su, sd);
+    const int lo = k, w = hiCol[k] - lo + 1;
     addSourcesLin(layer_rtj[k], rbase[l], su, sd, dRbase_up[l], dRbase_dn[l],
-                  dRbase_up[l + 1], dRbase_dn[l + 1]);
+                  dRbase_up[l + 1], dRbase_dn[l + 1], lo, w);
   }
 
   std::vector<Mat> dRtop_up(ltot + 1, zero_block), dRtop_dn(ltot + 1, zero_block);
@@ -1247,8 +1369,10 @@ static void computeTemperatureJacobianDynamic(
   for (int l = 1; l < ltot; ++l) {
     Mat su(nmu, ndof), sd(nmu, ndof);
     seedLayer(l, su, sd);
+    const int b = std::min(l + 1, nlay);
+    const int lo = loCol[b], hi = (l + 1 <= nlay) ? l + 1 : ndof - 1, w = hi - lo + 1;
     addSourcesLin(rtop[l], layer_rtj[l], dRtop_up[l], dRtop_dn[l], su, sd,
-                  dRtop_up[l + 1], dRtop_dn[l + 1]);
+                  dRtop_up[l + 1], dRtop_dn[l + 1], lo, w);
   }
 
   // TOA downwelling derivative: nonzero only when I_top_down = B[0]
@@ -1280,8 +1404,8 @@ static void computeTemperatureJacobianDynamic(
   Jm.assign(n_interfaces, std::vector<double>(ndof, 0.0));
   Jdv.assign(n_interfaces, std::vector<double>(ndof, 0.0));
 
-  auto reduce = [&](int k, const Mat& dIup, const Mat& dIdn) {
-    for (int m = 0; m < ndof; ++m) {
+  auto reduce = [&](int k, const Mat& dIup, const Mat& dIdn, int lo, int w) {
+    for (int m = lo; m < lo + w; ++m) {
       double fu = 0.0, fd = 0.0, jm = 0.0;
       for (int i = 0; i < nmu; ++i) {
         fu += 2.0 * PI * wt[i] * mu[i] * dIup(i, m);
@@ -1295,44 +1419,48 @@ static void computeTemperatureJacobianDynamic(
   };
 
   {
+    const int lo = 0, w = hiCol[0] - lo + 1;
     const auto& full = rbase[ltot];
-    Mat dIup = full.R_ab.eigen() * dItop_dn + full.T_ba.eigen() * dIbot_up
-               + dRbase_up[ltot];
-    reduce(0, dIup, dItop_dn);
+    Mat dIup = Mat::Zero(nmu, ndof);
+    dIup.middleCols(lo, w) = full.R_ab.eigen() * dItop_dn.middleCols(lo, w)
+                           + full.T_ba.eigen() * dIbot_up.middleCols(lo, w)
+                           + dRbase_up[ltot].middleCols(lo, w);
+    reduce(0, dIup, dItop_dn, lo, w);
   }
 
   for (int l = 1; l <= nlay; ++l) {
     int n_top = l;
     int n_base = ltot - l;
-    Mat dIup, dIdn;
+    const int lo = loCol[l], w = hiCol[l] - lo + 1;
+    Mat dIup = Mat::Zero(nmu, ndof), dIdn = Mat::Zero(nmu, ndof);
     if (n_base > 0) {
       const auto& top  = rtop[n_top];
       const auto& base = rbase[n_base];
       Mat Au = IdN - base.R_ab.eigen() * top.R_ba.eigen();
-      Mat rhs_u = base.T_ba.eigen() * dIbot_up
-                + base.R_ab.eigen() * (top.T_ab.eigen() * dItop_dn)
-                + base.R_ab.eigen() * dRtop_dn[n_top]
-                + dRbase_up[n_base];
-      dIup = Au.partialPivLu().solve(rhs_u);
+      Mat rhs_u = base.T_ba.eigen() * dIbot_up.middleCols(lo, w)
+                + base.R_ab.eigen() * (top.T_ab.eigen() * dItop_dn.middleCols(lo, w))
+                + base.R_ab.eigen() * dRtop_dn[n_top].middleCols(lo, w)
+                + dRbase_up[n_base].middleCols(lo, w);
+      dIup.middleCols(lo, w) = Au.partialPivLu().solve(rhs_u);
 
       Mat Ad = IdN - top.R_ba.eigen() * base.R_ab.eigen();
-      Mat rhs_d = top.T_ab.eigen() * dItop_dn
-                + top.R_ba.eigen() * (base.T_ba.eigen() * dIbot_up)
-                + top.R_ba.eigen() * dRbase_up[n_base]
-                + dRtop_dn[n_top];
-      dIdn = Ad.partialPivLu().solve(rhs_d);
+      Mat rhs_d = top.T_ab.eigen() * dItop_dn.middleCols(lo, w)
+                + top.R_ba.eigen() * (base.T_ba.eigen() * dIbot_up.middleCols(lo, w))
+                + top.R_ba.eigen() * dRbase_up[n_base].middleCols(lo, w)
+                + dRtop_dn[n_top].middleCols(lo, w);
+      dIdn.middleCols(lo, w) = Ad.partialPivLu().solve(rhs_d);
     } else {
       const auto& top = rtop[n_top];
-      dIdn = top.T_ab.eigen() * dItop_dn + top.R_ba.eigen() * dIbot_up
-             + dRtop_dn[n_top];
+      dIdn.middleCols(lo, w) = top.T_ab.eigen() * dItop_dn.middleCols(lo, w)
+                             + top.R_ba.eigen() * dIbot_up.middleCols(lo, w)
+                             + dRtop_dn[n_top].middleCols(lo, w);
       dIup = dIbot_up;
     }
-    reduce(l, dIup, dIdn);
+    reduce(l, dIup, dIdn, lo, w);
   }
 
   for (int k = 0; k < n_interfaces; ++k) {
-    int lyr = (k == 0) ? 0 : k - 1;
-    double pref = 4.0 * PI * (1.0 - cfg.single_scat_albedo[lyr]);
+    double pref = 4.0 * PI * (1.0 - fluxDivergenceOmega(cfg, k, nlay));
     for (int m = 0; m < ndof; ++m) {
       double dB_term = (m == k) ? 1.0 : 0.0;
       Jdv[k][m] = pref * (Jm[k][m] - dB_term);
@@ -1454,7 +1582,7 @@ static RTOutput solveDynamic(
 
   std::vector<DynLayerMatrices> layer_rtj;
   layer_rtj.reserve(nlay);
-  std::vector<double> tau_used(nlay);
+  std::vector<double> tau_used(nlay), omega_used(nlay), g_used(nlay);
 
   double tau_cumulative = 0.0;
 
@@ -1521,6 +1649,21 @@ static RTOutput solveDynamic(
     }
 
     tau_used[l] = tau_layer;
+    omega_used[l] = omega_layer;                 // delta-M scaled if applicable
+    {
+      double g_layer = 0.0;
+      if (omega_layer > 0.0 && tau_layer > 0.0) {
+        const auto& chi_full = cfg.phase_function_moments[l];
+        double chi1 = (chi_full.size() > 1) ? chi_full[1] : 0.0;
+        if (cfg.use_delta_m) {
+          double f_trunc = (static_cast<int>(chi_full.size()) > two_M) ? chi_full[two_M] : 0.0;
+          if (f_trunc > 1e-12 && f_trunc < 1.0 - 1e-12)
+            chi1 = (chi1 - f_trunc) / (1.0 - f_trunc);
+        }
+        g_layer = chi1;
+      }
+      g_used[l] = g_layer;                       // asymmetry parameter of the phase function used
+    }
     layer_rtj.push_back(
         dynDoubling(tau_layer, omega_layer, B_layer_top, B_layer_bot,
                      Ppp, Ppm, mu, wt,
@@ -1767,8 +1910,7 @@ static RTOutput solveDynamic(
   // the UNSCALED value and J is the full actinic mean intensity finalized above.
   for (int l = 0; l < n_interfaces; ++l)
   {
-    int lyr = (l == 0) ? 0 : l - 1;
-    result.flux_divergence[l] = 4.0 * PI * (1.0 - cfg.single_scat_albedo[lyr])
+    result.flux_divergence[l] = 4.0 * PI * (1.0 - fluxDivergenceOmega(cfg, l, nlay))
                                 * (result.mean_intensity[l] - B[l]);
   }
 
@@ -1793,7 +1935,8 @@ static RTOutput solveDynamic(
        static_cast<int>(cfg.planck_levels.size()) == nlay + 1))
   {
     computeTemperatureJacobianDynamic(cfg, nlay, ltot, has_surface, nmu, mu, wt,
-                                      tau_used, layer_rtj, rbase, rtop, result);
+                                      tau_used, omega_used, g_used,
+                                      layer_rtj, rbase, rtop, result);
   }
 
   if (cfg.index_from_bottom)

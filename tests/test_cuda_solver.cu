@@ -64,6 +64,14 @@ static void check_true(
 #define CHECK_TRUE(name, cond) \
   check_true(name, cond, __FILE__, __LINE__)
 
+// Relative tolerance for CUDA-vs-CPU comparisons: the per-thread (N <= 8) path
+// carries float32 products through the doubling and agrees with the double
+// CPU solver to ~1e-4; the batched (N > 8) path accumulates float32 round-off
+// as ~2^nn * eps and is limited to ~1e-3 for thick, strongly scattering
+// layers. The former absolute tolerances (up to 0.5 on fluxes of order 10)
+// let 1e-2 level errors through.
+static double rtol(double ref, double rel) { return rel * std::fabs(ref) + 1e-6; }
+
 
 // ============================================================================
 //  Helper: run CPU solver
@@ -206,9 +214,9 @@ void test_pure_absorption_beers_law() {
   auto cpu = cpuSolve(cfg);
   auto cuda = cudaSolveSingle(cfg);
 
-  CHECK_NEAR("flux_up_toa", cuda.flux_up, cpu.flux_up[0], 1e-4);
-  CHECK_NEAR("flux_down_toa", cuda.flux_down, cpu.flux_down[0], 1e-4);
-  CHECK_NEAR("flux_direct_toa", cuda.flux_direct, cpu.flux_direct[1], 1e-3);
+  CHECK_NEAR("flux_up_toa", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
+  CHECK_NEAR("flux_down_toa", cuda.flux_down, cpu.flux_down[0], rtol(cpu.flux_down[0], 5e-4));
+  CHECK_NEAR("flux_direct_toa", cuda.flux_direct, cpu.flux_direct[1], rtol(cpu.flux_direct[1], 1e-5));
   std::cout << "done\n";
 }
 
@@ -228,8 +236,8 @@ void test_pure_absorption_lambertian() {
   auto cpu = cpuSolve(cfg);
   auto cuda = cudaSolveSingle(cfg);
 
-  CHECK_NEAR("flux_up_toa", cuda.flux_up, cpu.flux_up[0], 1e-3);
-  CHECK_NEAR("flux_down_toa", cuda.flux_down, cpu.flux_down[0], 1e-4);
+  CHECK_NEAR("flux_up_toa", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
+  CHECK_NEAR("flux_down_toa", cuda.flux_down, cpu.flux_down[0], rtol(cpu.flux_down[0], 5e-4));
   std::cout << "done\n";
 }
 
@@ -415,8 +423,8 @@ void test_multilayer_rayleigh() {
   auto cpu = cpuSolve(cfg);
   auto cuda = cudaSolveSingle(cfg);
 
-  CHECK_NEAR("flux_up_toa", cuda.flux_up, cpu.flux_up[0], 1e-3);
-  CHECK_NEAR("flux_direct_bot", cuda.flux_direct, cpu.flux_direct[2], 1e-3);
+  CHECK_NEAR("flux_up_toa", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
+  CHECK_NEAR("flux_direct_bot", cuda.flux_direct, cpu.flux_direct[2], rtol(cpu.flux_direct[2], 1e-5));
   std::cout << "done\n";
 }
 
@@ -441,8 +449,8 @@ void test_multilayer_hg() {
   auto cpu = cpuSolve(cfg);
   auto cuda = cudaSolveSingle(cfg);
 
-  CHECK_NEAR("flux_up_toa", cuda.flux_up, cpu.flux_up[0], 5e-3);
-  CHECK_NEAR("flux_direct_bot", cuda.flux_direct, cpu.flux_direct[2], 5e-3);
+  CHECK_NEAR("flux_up_toa", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
+  CHECK_NEAR("flux_direct_bot", cuda.flux_direct, cpu.flux_direct[2], rtol(cpu.flux_direct[2], 1e-5));
   std::cout << "done\n";
 }
 
@@ -463,8 +471,8 @@ void test_multilayer_isotropic() {
   auto cpu = cpuSolve(cfg);
   auto cuda = cudaSolveSingle(cfg);
 
-  CHECK_NEAR("flux_up_toa", cuda.flux_up, cpu.flux_up[0], 1e-3);
-  CHECK_NEAR("flux_direct_bot", cuda.flux_direct, cpu.flux_direct[3], 1e-3);
+  CHECK_NEAR("flux_up_toa", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
+  CHECK_NEAR("flux_direct_bot", cuda.flux_direct, cpu.flux_direct[3], rtol(cpu.flux_direct[3], 1e-5));
   std::cout << "done\n";
 }
 
@@ -530,8 +538,8 @@ void test_six_layer() {
     auto cpu = cpuSolve(cfg);
     auto cuda = cudaSolveSingle(cfg);
 
-    CHECK_NEAR("9a_flux_up", cuda.flux_up, cpu.flux_up[0], 5e-3);
-    CHECK_NEAR("9a_flux_down", cuda.flux_down, cpu.flux_down[0], 5e-3);
+    CHECK_NEAR("9a_flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
+    CHECK_NEAR("9a_flux_down", cuda.flux_down, cpu.flux_down[0], rtol(cpu.flux_down[0], 5e-4));
   }
 
   // 9b: Anisotropic (DGIS)
@@ -566,8 +574,8 @@ void test_six_layer() {
     auto cpu = cpuSolve(cfg);
     auto cuda = cudaSolveSingle(cfg);
 
-    CHECK_NEAR("9b_flux_up", cuda.flux_up, cpu.flux_up[0], 5e-3);
-    CHECK_NEAR("9b_flux_down", cuda.flux_down, cpu.flux_down[0], 5e-3);
+    CHECK_NEAR("9b_flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
+    CHECK_NEAR("9b_flux_down", cuda.flux_down, cpu.flux_down[0], rtol(cpu.flux_down[0], 5e-4));
   }
 
   std::cout << "done\n";
@@ -596,9 +604,9 @@ void test_combined_sources() {
     auto cpu = cpuSolve(cfg);
     auto cuda = cudaSolveSingle(cfg);
 
-    CHECK_NEAR("11a_flux_up", cuda.flux_up, cpu.flux_up[0], 5e-3);
-    CHECK_NEAR("11a_flux_down", cuda.flux_down, cpu.flux_down[0], 5e-3);
-    CHECK_NEAR("11a_flux_direct", cuda.flux_direct, cpu.flux_direct[1], 5e-3);
+    CHECK_NEAR("11a_flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
+    CHECK_NEAR("11a_flux_down", cuda.flux_down, cpu.flux_down[0], rtol(cpu.flux_down[0], 5e-4));
+    CHECK_NEAR("11a_flux_direct", cuda.flux_direct, cpu.flux_direct[1], rtol(cpu.flux_direct[1], 1e-5));
   }
 
   // 11b: layer split (same problem, 3 layers)
@@ -617,9 +625,9 @@ void test_combined_sources() {
     auto cpu = cpuSolve(cfg);
     auto cuda = cudaSolveSingle(cfg);
 
-    CHECK_NEAR("11b_flux_up", cuda.flux_up, cpu.flux_up[0], 5e-3);
-    CHECK_NEAR("11b_flux_down", cuda.flux_down, cpu.flux_down[0], 5e-3);
-    CHECK_NEAR("11b_flux_direct", cuda.flux_direct, cpu.flux_direct[3], 1e-3);
+    CHECK_NEAR("11b_flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
+    CHECK_NEAR("11b_flux_down", cuda.flux_down, cpu.flux_down[0], rtol(cpu.flux_down[0], 5e-4));
+    CHECK_NEAR("11b_flux_direct", cuda.flux_direct, cpu.flux_direct[3], rtol(cpu.flux_direct[3], 1e-5));
   }
 
   std::cout << "done\n";
@@ -651,8 +659,8 @@ void test_thermal_7a() {
   auto cpu = cpuSolve(cfg);
   auto cuda = cudaSolveSingle(cfg);
 
-  CHECK_NEAR("7a_flux_up", cuda.flux_up, cpu.flux_up[0], 0.5);
-  CHECK_NEAR("7a_flux_down", cuda.flux_down, cpu.flux_down[0], 0.5);
+  CHECK_NEAR("7a_flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
+  CHECK_NEAR("7a_flux_down", cuda.flux_down, cpu.flux_down[0], rtol(cpu.flux_down[0], 5e-4));
   std::cout << "done\n";
 }
 
@@ -681,9 +689,9 @@ void test_thermal_7c() {
   auto cuda = cudaSolveSingle(cfg);
 
   // Wider tolerance — large Planck values, float precision
-  double tol = 0.02 * std::abs(cpu.flux_up[0]);
-  CHECK_NEAR("7c_flux_up", cuda.flux_up, cpu.flux_up[0], tol);
-  CHECK_NEAR("7c_flux_direct", cuda.flux_direct, cpu.flux_direct[1], 1e-3);
+  double tol = rtol(cpu.flux_up[0], 5e-4);
+  CHECK_NEAR("7c_flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
+  CHECK_NEAR("7c_flux_direct", cuda.flux_direct, cpu.flux_direct[1], rtol(cpu.flux_direct[1], 1e-5));
   std::cout << "done\n";
 }
 
@@ -709,7 +717,7 @@ void test_thermal_pure_absorption() {
   auto cpu = cpuSolve(cfg);
   auto cuda = cudaSolveSingle(cfg);
 
-  CHECK_NEAR("flux_up", cuda.flux_up, cpu.flux_up[0], 0.5);
+  CHECK_NEAR("flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
   CHECK_TRUE("flux_up_pos", cuda.flux_up > 0.0);
   CHECK_TRUE("not_nan", !std::isnan(cuda.flux_up));
   std::cout << "done\n";
@@ -737,7 +745,7 @@ void test_thermal_scattering() {
   auto cpu = cpuSolve(cfg);
   auto cuda = cudaSolveSingle(cfg);
 
-  CHECK_NEAR("flux_up", cuda.flux_up, cpu.flux_up[0], 0.5);
+  CHECK_NEAR("flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
   CHECK_TRUE("not_nan_up", !std::isnan(cuda.flux_up));
   CHECK_TRUE("not_nan_down", !std::isnan(cuda.flux_down));
   std::cout << "done\n";
@@ -775,7 +783,7 @@ void test_thermal_surface_temperature() {
     auto cuda = cudaSolveSingle(cfg);
 
     double tol = 0.01 * std::abs(cpu.flux_up[0]) + 0.1;
-    CHECK_NEAR("surfT_flux_up", cuda.flux_up, cpu.flux_up[0], tol);
+    CHECK_NEAR("surfT_flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
     CHECK_TRUE("surfT_not_nan", !std::isnan(cuda.flux_up));
 
     // A hotter black surface must emit more than the sentinel (bottom level T).
@@ -857,7 +865,7 @@ void test_thermal_hg_deltam() {
   auto cuda = cudaSolveSingle(cfg);
 
   double tol = 0.02 * std::abs(cpu.flux_up[0]) + 0.5;
-  CHECK_NEAR("flux_up", cuda.flux_up, cpu.flux_up[0], tol);
+  CHECK_NEAR("flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
   CHECK_TRUE("flux_up_pos", cuda.flux_up > 0.0);
   CHECK_TRUE("not_nan", !std::isnan(cuda.flux_up));
   std::cout << "done\n";
@@ -893,8 +901,8 @@ void test_energy_conservation() {
     auto cpu = cpuSolve(cfg);
     auto cuda = cudaSolveSingle(cfg);
 
-    CHECK_NEAR("cons_flux_up", cuda.flux_up, cpu.flux_up[0], 5e-3);
-    CHECK_NEAR("cons_flux_down", cuda.flux_down, cpu.flux_down[0], 5e-3);
+    CHECK_NEAR("cons_flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
+    CHECK_NEAR("cons_flux_down", cuda.flux_down, cpu.flux_down[0], rtol(cpu.flux_down[0], 5e-4));
   }
 
   // Conservative with delta-M
@@ -916,8 +924,8 @@ void test_energy_conservation() {
     auto cpu = cpuSolve(cfg);
     auto cuda = cudaSolveSingle(cfg);
 
-    CHECK_NEAR("deltam_flux_up", cuda.flux_up, cpu.flux_up[0], 5e-3);
-    CHECK_NEAR("deltam_flux_down", cuda.flux_down, cpu.flux_down[0], 5e-3);
+    CHECK_NEAR("deltam_flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
+    CHECK_NEAR("deltam_flux_down", cuda.flux_down, cpu.flux_down[0], rtol(cpu.flux_down[0], 5e-4));
   }
 
   std::cout << "done\n";
@@ -1010,7 +1018,7 @@ void test_flux_solver_cases() {
     auto cpu = cpuSolve(cfg);
     auto cuda = cudaSolveSingle(cfg);
 
-    CHECK_NEAR("iso_beam_up", cuda.flux_up, cpu.flux_up[0], 5e-3);
+    CHECK_NEAR("iso_beam_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
     CHECK_TRUE("iso_beam_up_pos", cuda.flux_up > 0.0);
   }
 
@@ -1032,7 +1040,7 @@ void test_flux_solver_cases() {
     auto cpu = cpuSolve(cfg);
     auto cuda = cudaSolveSingle(cfg);
 
-    CHECK_NEAR("multi_flux_up", cuda.flux_up, cpu.flux_up[0], 5e-3);
+    CHECK_NEAR("multi_flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
     CHECK_TRUE("multi_not_nan", !std::isnan(cuda.flux_up));
   }
 
@@ -1053,7 +1061,7 @@ void test_flux_solver_cases() {
     auto cpu = cpuSolve(cfg);
     auto cuda = cudaSolveSingle(cfg);
 
-    CHECK_NEAR("thick_flux_up", cuda.flux_up, cpu.flux_up[0], 1e-3);
+    CHECK_NEAR("thick_flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
     CHECK_TRUE("thick_direct_zero", cuda.flux_direct < 1e-15);
     CHECK_TRUE("thick_not_nan", !std::isnan(cuda.flux_up));
   }
@@ -1075,7 +1083,7 @@ void test_flux_solver_cases() {
     auto cpu = cpuSolve(cfg);
     auto cuda = cudaSolveSingle(cfg);
 
-    CHECK_NEAR("refl_flux_up", cuda.flux_up, cpu.flux_up[0], 5e-3);
+    CHECK_NEAR("refl_flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
     CHECK_TRUE("refl_up_pos", cuda.flux_up > 0.0);
   }
 
@@ -1111,7 +1119,7 @@ void test_mixed_atmosphere() {
   auto cpu = cpuSolve(cfg);
   auto cuda = cudaSolveSingle(cfg);
 
-  CHECK_NEAR("mixed_flux_up", cuda.flux_up, cpu.flux_up[0], 0.1);
+  CHECK_NEAR("mixed_flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
   CHECK_TRUE("mixed_not_nan_up", !std::isnan(cuda.flux_up));
   CHECK_TRUE("mixed_not_nan_down", !std::isnan(cuda.flux_down));
   CHECK_TRUE("mixed_direct_atten", cuda.flux_direct < cpu.flux_direct[0]);
@@ -1147,7 +1155,7 @@ void test_diffusion_bc() {
     auto cpu = cpuSolve(cfg);
     auto cuda = cudaSolveSingle(cfg);
 
-    CHECK_NEAR("diffbc_abs_up", cuda.flux_up, cpu.flux_up[0], 0.5);
+    CHECK_NEAR("diffbc_abs_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
     CHECK_TRUE("diffbc_abs_pos", cuda.flux_up > 0.0);
   }
 
@@ -1172,7 +1180,7 @@ void test_diffusion_bc() {
     auto cpu = cpuSolve(cfg);
     auto cuda = cudaSolveSingle(cfg);
 
-    CHECK_NEAR("diffbc_scat_up", cuda.flux_up, cpu.flux_up[0], 0.5);
+    CHECK_NEAR("diffbc_scat_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
     CHECK_TRUE("diffbc_scat_not_nan", !std::isnan(cuda.flux_up));
   }
 
@@ -1199,7 +1207,7 @@ void test_diffusion_bc() {
     auto cuda = cudaSolveSingle(cfg);
 
     double tol = 0.02 * std::abs(cpu.flux_up[0]) + 0.5;
-    CHECK_NEAR("diffbc_deltam_up", cuda.flux_up, cpu.flux_up[0], tol);
+    CHECK_NEAR("diffbc_deltam_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
     CHECK_TRUE("diffbc_deltam_pos", cuda.flux_up > 0.0);
   }
 
@@ -1232,7 +1240,7 @@ void test_rayleigh_spherical_albedo() {
   auto cpu = cpuSolve(cfg);
   auto cuda = cudaSolveSingle(cfg);
 
-  CHECK_NEAR("sph_alb_up", cuda.flux_up, cpu.flux_up[0], 0.05);
+  CHECK_NEAR("sph_alb_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 2e-3));
 
   double albedo = cuda.flux_up / (cfg.solar_flux * cfg.solar_mu);
   CHECK_TRUE("albedo_range", albedo > 0.15 && albedo < 0.25);
@@ -1313,8 +1321,8 @@ void test_optically_thick() {
   auto cpu = cpuSolve(cfg);
   auto cuda = cudaSolveSingle(cfg);
 
-  CHECK_NEAR("flux_up", cuda.flux_up, cpu.flux_up[0], 1.0);
-  CHECK_NEAR("flux_down", cuda.flux_down, cpu.flux_down[0], 1.0);
+  CHECK_NEAR("flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
+  CHECK_NEAR("flux_down", cuda.flux_down, cpu.flux_down[0], rtol(cpu.flux_down[0], 5e-4));
   std::cout << "done\n";
 }
 
@@ -1438,8 +1446,8 @@ void test_multilayer_varying() {
   auto cpu = cpuSolve(cfg);
   auto cuda = cudaSolveSingle(cfg);
 
-  CHECK_NEAR("flux_up", cuda.flux_up, cpu.flux_up[0], 1.0);
-  CHECK_NEAR("flux_down", cuda.flux_down, cpu.flux_down[0], 1.0);
+  CHECK_NEAR("flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
+  CHECK_NEAR("flux_down", cuda.flux_down, cpu.flux_down[0], rtol(cpu.flux_down[0], 5e-4));
   std::cout << "done\n";
 }
 
@@ -1466,8 +1474,8 @@ void test_linear_source_pure_absorption() {
   auto cuda = cudaSolveSingle(cfg);
 
   // Compare CUDA against CPU (CPU already matches analytical to 1e-8)
-  CHECK_NEAR("flux_up", cuda.flux_up, cpu.flux_up[0], 1e-4);
-  CHECK_NEAR("flux_down", cuda.flux_down, cpu.flux_down[0], 1e-4);
+  CHECK_NEAR("flux_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 5e-4));
+  CHECK_NEAR("flux_down", cuda.flux_down, cpu.flux_down[0], rtol(cpu.flux_down[0], 5e-4));
   std::cout << "done\n";
 }
 
@@ -1493,8 +1501,8 @@ void test_n16_specific() {
     auto cpu = cpuSolve(cfg);
     auto cuda = cudaSolveSingle(cfg);
 
-    CHECK_NEAR("n16_abs_up", cuda.flux_up, cpu.flux_up[0], 1e-3);
-    CHECK_NEAR("n16_abs_direct", cuda.flux_direct, cpu.flux_direct[1], 1e-2);
+    CHECK_NEAR("n16_abs_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 2e-3));
+    CHECK_NEAR("n16_abs_direct", cuda.flux_direct, cpu.flux_direct[1], rtol(cpu.flux_direct[1], 1e-5));
   }
 
   // Isotropic scattering at N=16
@@ -1511,7 +1519,7 @@ void test_n16_specific() {
     auto cpu = cpuSolve(cfg);
     auto cuda = cudaSolveSingle(cfg);
 
-    CHECK_NEAR("n16_iso_up", cuda.flux_up, cpu.flux_up[0], 0.01);
+    CHECK_NEAR("n16_iso_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 2e-3));
   }
 
   // Multi-layer with surface at N=16
@@ -1529,8 +1537,8 @@ void test_n16_specific() {
     auto cpu = cpuSolve(cfg);
     auto cuda = cudaSolveSingle(cfg);
 
-    CHECK_NEAR("n16_multi_up", cuda.flux_up, cpu.flux_up[0], 0.02);
-    CHECK_NEAR("n16_multi_direct", cuda.flux_direct, cpu.flux_direct[3], 0.01);
+    CHECK_NEAR("n16_multi_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 2e-3));
+    CHECK_NEAR("n16_multi_direct", cuda.flux_direct, cpu.flux_direct[3], rtol(cpu.flux_direct[3], 1e-5));
   }
 
   // Thermal at N=16
@@ -1555,7 +1563,7 @@ void test_n16_specific() {
     auto cuda = cudaSolveSingle(cfg);
 
     double tol = 0.02 * std::abs(cpu.flux_up[0]) + 1.0;
-    CHECK_NEAR("n16_thermal_up", cuda.flux_up, cpu.flux_up[0], tol);
+    CHECK_NEAR("n16_thermal_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 2e-3));
   }
 
   // Combined solar + thermal at N=16
@@ -1575,7 +1583,7 @@ void test_n16_specific() {
     auto cpu = cpuSolve(cfg);
     auto cuda = cudaSolveSingle(cfg);
 
-    CHECK_NEAR("n16_combined_up", cuda.flux_up, cpu.flux_up[0], 0.1);
+    CHECK_NEAR("n16_combined_up", cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 2e-3));
     CHECK_TRUE("n16_combined_pos", cuda.flux_up > 0.0);
   }
 
