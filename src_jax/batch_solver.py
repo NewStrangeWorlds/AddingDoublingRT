@@ -116,8 +116,8 @@ def _add_layers(top, bot):
 #  JIT-compiled core solver
 # ============================================================================
 
-@functools.partial(jax.jit, static_argnums=(0, 1, 2, 3))
-def _solve_core(nlay, N, nn_max, has_surface,
+@functools.partial(jax.jit, static_argnums=(0, 1, 3))
+def _solve_core(nlay, N, nn_layers, has_surface,
                 delta_tau, ssa, planck_levels,
                 PppC_all, PpmC_all,
                 p_plus_solar_all, p_minus_solar_all,
@@ -125,8 +125,9 @@ def _solve_core(nlay, N, nn_max, has_surface,
                 solar_flux, solar_mu):
     """JIT-compiled core of the batch solver.
 
-    Static args (traced as constants): nlay, N, nn_max, has_surface.
-    Dynamic args (JAX arrays): everything else.
+    Static args (traced as constants): nlay, N, has_surface.
+    Dynamic args (JAX arrays): everything else; nn_layers (nlay,) int32 is the
+    per-layer doubling count (max over the wavenumbers of that layer).
 
     delta_tau: (nwav, nlay)
     ssa: (nwav, nlay)
@@ -171,7 +172,8 @@ def _solve_core(nlay, N, nn_max, has_surface,
         Spp = con[:, None, None] * PppC[None] / mu[None, :, None]
         Spm = con[:, None, None] * PpmC[None] / mu[None, :, None]
 
-        tau0 = tau_l / (2.0 ** nn_max)
+        nn_l = nn_layers[layer_idx]
+        tau0 = tau_l / jnp.exp2(nn_l.astype(jnp.float32))
         g_k = 0.5 * tau0
 
         # Initial state (exact extinction + single scattering, Taylor double scattering)
@@ -185,11 +187,11 @@ def _solve_core(nlay, N, nn_max, has_surface,
             F_top, p_plus, p_minus, jnp.maximum(solar_mu, 1e-30))
         gamma_sol = jnp.exp(-tau0 / jnp.maximum(solar_mu, 1e-30))
 
-        # Doubling iterations
-        (R_k, T_k, y_k, z_k, _, s_up_sol, s_down_sol, _), _ = jax.lax.scan(
-            _doubling_step,
-            (R_k, T_k, y_k, z_k, g_k, s_up_sol, s_down_sol, gamma_sol),
-            None, length=nn_max)
+        # Doubling iterations: per-layer trip count (dynamic -> while loop)
+        (R_k, T_k, y_k, z_k, _, s_up_sol, s_down_sol, _) = jax.lax.fori_loop(
+            0, nn_l,
+            lambda _k, c: _doubling_step(c, None)[0],
+            (R_k, T_k, y_k, z_k, g_k, s_up_sol, s_down_sol, gamma_sol))
 
         s_up = y_k * B_bar[:, None] + z_k * B_d[:, None]
         s_down = y_k * B_bar[:, None] - z_k * B_d[:, None]
@@ -289,8 +291,8 @@ def _solve_core(nlay, N, nn_max, has_surface,
 #  Sequential-wavenumber core (CPU-efficient via jax.lax.map)
 # ============================================================================
 
-@functools.partial(jax.jit, static_argnums=(0, 1, 2, 3))
-def _solve_core_map(nlay, N, nn_max, has_surface,
+@functools.partial(jax.jit, static_argnums=(0, 1, 3))
+def _solve_core_map(nlay, N, nn_wl, has_surface,
                     delta_tau, ssa, planck_levels,
                     PppC_all, PpmC_all,
                     p_plus_solar_all, p_minus_solar_all,
@@ -345,7 +347,7 @@ def _solve_core_map(nlay, N, nn_max, has_surface,
 
     def solve_one(wav_inputs):
         """Full RT solve for a single wavenumber — all arrays are unbatched."""
-        dtau_1, ssa_1, plan_1 = wav_inputs   # (nlay,), (nlay,), (nlev,)
+        dtau_1, ssa_1, plan_1, nn_1 = wav_inputs   # (nlay,), (nlay,), (nlev,), (nlay,) int32
 
         tau_cum_1 = jnp.concatenate([
             jnp.zeros((1,), dtype=jnp.float32),
@@ -370,7 +372,8 @@ def _solve_core_map(nlay, N, nn_max, has_surface,
             Spp = con * PppC_all[layer_idx] / mu[:, None]
             Spm = con * PpmC_all[layer_idx] / mu[:, None]
 
-            tau0 = tau_l / (2.0 ** nn_max)
+            nn_l = nn_1[layer_idx]
+            tau0 = tau_l / jnp.exp2(nn_l.astype(jnp.float32))
             g_k  = 0.5 * tau0   # scalar
 
             F_top = solar_flux * jnp.exp(
@@ -403,10 +406,10 @@ def _solve_core_map(nlay, N, nn_max, has_surface,
                 return (R_new, T_new, y_new, z_new, g_new,
                         su_s_new, sd_s_new, gam * gam), None
 
-            (R_k, T_k, y_k, z_k, _, s_up_sol, s_down_sol, _), _ = jax.lax.scan(
-                doubling_1,
-                (R_k, T_k, y_k, z_k, g_k, s_up_sol, s_down_sol, gamma_sol),
-                None, length=nn_max)
+            (R_k, T_k, y_k, z_k, _, s_up_sol, s_down_sol, _) = jax.lax.fori_loop(
+                0, nn_l,
+                lambda _k, c: doubling_1(c, None)[0],
+                (R_k, T_k, y_k, z_k, g_k, s_up_sol, s_down_sol, gamma_sol))
 
             s_up   = y_k * B_bar + z_k * B_d
             s_down = y_k * B_bar - z_k * B_d
@@ -456,7 +459,7 @@ def _solve_core_map(nlay, N, nn_max, has_surface,
         flux_down = jnp.sum(2.0 * PI * wt * mu * Idown_boa)
         return flux_up, flux_down
 
-    return jax.lax.map(solve_one, (delta_tau, ssa, planck_levels))
+    return jax.lax.map(solve_one, (delta_tau, ssa, planck_levels, nn_wl))
 
 
 # ============================================================================
@@ -475,24 +478,27 @@ class BatchConfig:
         self.solar_mu = 1.0
 
 
-def _compute_nn_max(delta_tau, ssa, mu_min):
-    """Compute max doubling iterations across all wavenumbers and layers.
+def _compute_nn_layers(delta_tau, ssa, mu_min):
+    """Per-(wavenumber, layer) doubling counts, shape (nwav, nlay), int32.
 
     Omega-adaptive rule plus the extinction floor tau0 = tau / 2**nn <= mu_min / 2
-    (mirrors adrt::computeDoublingCount).
+    (mirrors adrt::computeDoublingCount). Non-scattering or empty entries get 1:
+    the thin-layer start is exact for omega = 0 at any tau0.
     """
-    tau_flat = np.asarray(delta_tau).ravel()
-    omega_flat = np.asarray(ssa).ravel()
-    # Filter to scattering entries only
-    mask = (omega_flat > 0.0) & (tau_flat > 0.0)
-    if not np.any(mask):
-        return 1
-    tau_s = tau_flat[mask]
-    omega_s = omega_flat[mask]
-    ipow0 = np.where(omega_s < 0.01, 4, np.where(omega_s < 0.1, 10, 16))
-    nn = (np.log(tau_s) / np.log(2.0)).astype(int) + ipow0
+    tau = np.asarray(delta_tau, dtype=np.float64)
+    omega = np.asarray(ssa, dtype=np.float64)
+    mask = (omega > 0.0) & (tau > 0.0)
+    tau_s = np.where(mask, tau, 1.0)
+    ipow0 = np.where(omega < 0.01, 4, np.where(omega < 0.1, 10, 16))
+    nn = np.floor(np.log2(tau_s)).astype(int) + ipow0
     n_ext = np.ceil(np.log2(tau_s / mu_min)).astype(int) + 1
-    return int(max(1, np.max(nn), np.max(n_ext)))
+    nn = np.maximum(1, np.maximum(nn, n_ext))
+    return np.where(mask, nn, 1).astype(np.int32)
+
+
+def _compute_nn_max(delta_tau, ssa, mu_min):
+    """Max doubling count over all wavenumbers and layers (diagnostics)."""
+    return int(np.max(_compute_nn_layers(delta_tau, ssa, mu_min)))
 
 
 def solve_batch(config, delta_tau, ssa, phase_moments, planck_levels, use_map=False):
@@ -549,7 +555,10 @@ def solve_batch(config, delta_tau, ssa, phase_moments, planck_levels, use_map=Fa
     p_plus_all = jnp.stack(p_plus_list).astype(jnp.float32)   # (nlay, N)
     p_minus_all = jnp.stack(p_minus_list).astype(jnp.float32) # (nlay, N)
 
-    nn_max = _compute_nn_max(delta_tau, ssa, float(np.min(np.asarray(mu))))
+    # Per-layer doubling counts: the batched core runs each layer with the max
+    # over its wavenumbers; the map core uses the per-wavenumber values.
+    nn_wl = _compute_nn_layers(delta_tau, ssa, float(np.min(np.asarray(mu))))
+    nn_arg = jnp.asarray(nn_wl if use_map else nn_wl.max(axis=0), dtype=jnp.int32)
     has_surface = config.surface_albedo > 0.0 or float(np.max(planck_levels[:, -1])) > 0.0
 
     mu = mu.astype(jnp.float32)
@@ -558,7 +567,7 @@ def solve_batch(config, delta_tau, ssa, phase_moments, planck_levels, use_map=Fa
 
     core = _solve_core_map if use_map else _solve_core
     return core(
-        nlay, N, nn_max, has_surface,
+        nlay, N, nn_arg, has_surface,
         jnp.asarray(delta_tau, dtype=jnp.float32),
         jnp.asarray(ssa, dtype=jnp.float32),
         jnp.asarray(planck_levels, dtype=jnp.float32),

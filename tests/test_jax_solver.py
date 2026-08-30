@@ -1661,18 +1661,16 @@ class TestWeakScattering:
             np.testing.assert_allclose(np.asarray(r3.flux_down), f0d, rtol=5e-3, atol=5e-3 * f0u.max())
 
     def test_batch_solver_matches_pure_absorption(self):
-        """solve_batch (float32 batched path): weakly scattering column vs omega = 0.
+        """solve_batch (float32 batched path): weakly scattering column vs omega = 0,
+        and vs the float64 per-layer solve() as an absolute anchor.
 
-        Pinned to the CPU device: as of JAX 0.6.2 the batched core returns
-        wrong (deterministic) fluxes on the GPU backend for batches mixing
-        scattering and non-scattering wavenumbers, independently of the
-        doubling start (verified against the pre-2026-08 code). The CPU
-        platform agrees with the C++ solver to float32 accuracy.
+        Requires true float32 matmuls (src_jax/__init__.py sets
+        jax_default_matmul_precision = "highest"): with TF32 the doubling
+        recursion compounds the ~1e-3 per-product error as 2**nn and the GPU
+        backend returned O(1) wrong fluxes for batches with nn >= ~10.
         """
-        import jax
         from src_jax.batch_solver import BatchConfig, solve_batch
-        with jax.default_device(jax.devices("cpu")[0]):
-            self._run_batch_column(BatchConfig, solve_batch)
+        self._run_batch_column(BatchConfig, solve_batch)
 
     @staticmethod
     def _run_batch_column(BatchConfig, solve_batch):
@@ -1689,12 +1687,26 @@ class TestWeakScattering:
         ssa = np.array([[om] * nl for om in omegas])
         pmom = np.zeros((nl, 16)); pmom[:, 0] = 1.0; pmom[:, 2] = 0.1   # Rayleigh
         planck = np.tile(1.0 + 4.0 * (np.log10(tcum) + 4.0) / 7.0, (len(omegas), 1))
+        # Absolute anchor: the float64 per-layer solver on the same column
+        # (solve_batch treats planck[-1] as the surface emission).
+        ref = []
+        for om in omegas:
+            cfg = ADConfig(num_layers=nl, num_quadrature=8)
+            cfg.surface_albedo = 0.0
+            cfg.surface_emission = float(planck[0, -1])
+            cfg.allocate()
+            cfg.delta_tau[:] = dtau[0]
+            cfg.single_scat_albedo[:] = om
+            cfg.set_rayleigh()
+            cfg.planck_levels = planck[0].copy()
+            ref.append(float(solve(cfg).flux_up[0]))
+        ref = np.array(ref)
         for use_map in (False, True):
             f_up, f_dn = solve_batch(bc, dtau, ssa, pmom, planck, use_map=use_map)
             f_up = np.asarray(f_up)
             assert np.all(np.isfinite(f_up))
+            np.testing.assert_allclose(f_up, ref, rtol=3e-3, err_msg=str(use_map))
             assert abs(f_up[1] - f_up[0]) <= 2e-4 * f_up[0], (use_map, f_up)
-            assert abs(f_up[2] - f_up[0]) <= 5e-3 * f_up[0], (use_map, f_up)
 
 
 if __name__ == "__main__":

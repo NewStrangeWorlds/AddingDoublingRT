@@ -8,6 +8,11 @@ plane-parallel atmospheres.
 
 import jax
 jax.config.update("jax_enable_x64", True)
+# The batched solver (batch_solver.py) works in float32. On NVIDIA GPUs JAX
+# lowers float32 matmuls to TF32 by default (~1e-3 relative error per product);
+# the doubling recursion squares the transmission operator nn times, so that
+# error compounds as ~2^nn and produced O(1) wrong fluxes. Force true float32.
+jax.config.update("jax_default_matmul_precision", "highest")
 
 from .config import ADConfig, RTOutput
 from .solver import solve
