@@ -16,12 +16,43 @@ namespace adrt {
 namespace cuda {
 
 /// Adaptive number of initial doublings based on single-scattering albedo.
-/// Reduced from (4, 10, 16) thanks to second-order thin-layer initialization
-/// which gives O(tau0^3) starting error instead of O(tau0^2).
+/// The GPU backends use fewer doublings than the CPU (4, 10, 16): the start is
+/// exact through single scattering with an O(tau0^3) multiple-scattering
+/// truncation, and single precision limits the attainable accuracy to ~1e-4
+/// anyway. (2, 8, 12) keeps the flux error of the thin-layer start at or below
+/// that level; the former (2, 5, 8) gave 1e-2 level thermal-source errors for
+/// strongly scattering thick layers.
 __device__ __forceinline__ int compute_ipow0(float omega) {
   if (omega < 0.01f) return 2;
-  if (omega < 0.1f)  return 5;
-  return 8;
+  if (omega < 0.1f)  return 8;
+  return 12;
+}
+
+/// Number of doublings: omega-adaptive rule plus the extinction floor
+/// tau0 = tau / 2^nn <= mu_min / 2 (mirrors adrt::computeDoublingCount).
+template<int N>
+__device__ __forceinline__ int compute_doubling_count(float tau, float omega) {
+  int nn = static_cast<int>(logf(tau) / logf(2.0f)) + compute_ipow0(omega);
+
+  float mu_min = d_mu[0];
+  #pragma unroll
+  for (int i = 1; i < N; ++i) mu_min = fminf(mu_min, d_mu[i]);
+
+  int n_ext = static_cast<int>(ceilf(log2f(tau / mu_min))) + 1;
+
+  return max(1, max(nn, n_ext));
+}
+
+/// phi(u) = expm1(u) / u, phi(0) = 1.
+__device__ __forceinline__ float doubling_phi(float u) {
+  return (fabsf(u) < 1e-6f) ? 1.0f + 0.5f * u : expm1f(u) / u;
+}
+
+/// int_0^tau0 exp(-(tau0-t)/mu_i) exp(-t/mu_j) dt = (e_j - e_i) / d, d = 1/mu_i - 1/mu_j.
+/// tau0 e_i phi(tau0 d) for small |tau0 d|, difference form otherwise (no overflow).
+__device__ __forceinline__ float doubling_path_integral(float tau0, float d, float e_i, float e_j) {
+  float u = tau0 * d;
+  return (fabsf(u) < 1.0f) ? tau0 * e_i * doubling_phi(u) : (e_j - e_i) / d;
 }
 
 /// Doubling algorithm for a single homogeneous layer.
@@ -84,27 +115,23 @@ __device__ __forceinline__ void doubling(
 
   float con = 2.0f * omega * PI;
 
-  // Build Gpp = (I - 2*omega*pi*Ppp*C) / diag(mu)
-  // Build Gpm = 2*omega*pi*Ppm*C / diag(mu)
-  GpuMatrix<N> Gpp, Gpm;
+  // Scattering operators (C = diag(wt), so (P*C)(i,j) = P(i,j)*wt[j]):
+  //   Spp = 2*omega*pi*Ppp*C / diag(mu)   (forward,  same hemisphere)
+  //   Spm = 2*omega*pi*Ppm*C / diag(mu)   (backward, opposite hemisphere)
+  GpuMatrix<N> Spp, Spm;
 
-  // C = diag(wt), so (P*C)(i,j) = P(i,j)*wt[j]
   #pragma unroll
   for (int i = 0; i < N; ++i) {
     float inv_mu = 1.0f / d_mu[i];
     #pragma unroll
     for (int j = 0; j < N; ++j) {
-      float ppc = Ppp(i, j) * d_wt[j];
-      float pmc = Ppm(i, j) * d_wt[j];
-      float delta_ij = (i == j) ? 1.0f : 0.0f;
-      Gpp(i, j) = (delta_ij - con * ppc) * inv_mu;
-      Gpm(i, j) = con * pmc * inv_mu;
+      Spp(i, j) = con * Ppp(i, j) * d_wt[j] * inv_mu;
+      Spm(i, j) = con * Ppm(i, j) * d_wt[j] * inv_mu;
     }
   }
 
   // Adaptive doubling count
-  int nn = static_cast<int>(logf(tau) / logf(2.0f)) + compute_ipow0(omega);
-  if (nn < 2) nn = 2;
+  int nn = compute_doubling_count<N>(tau, omega);
 
   float xfac = 1.0f / exp2f(static_cast<float>(nn));
   float tau0 = tau * xfac;
@@ -112,63 +139,107 @@ __device__ __forceinline__ void doubling(
   bool has_solar = (solar_flux > 0.0f && solar_mu > 0.0f && has_solar_phase);
   float F_top = has_solar ? solar_flux * expf(-tau_cumulative / solar_mu) : 0.0f;
 
-  // Second-order thin-layer initialization (error O(tau0^3) instead of O(tau0^2)).
-  // From the Taylor expansion of the interaction principle:
-  //   T = I - tau0*Gpp + (tau0^2/2)*(Gpp^2 + Gpm^2)
-  //   R = tau0*Gpm - (tau0^2/2)*(Gpp*Gpm + Gpm*Gpp)
-  // Computed sequentially to reuse temporaries (A, B declared later for doubling loop).
+  // Thin-layer initialisation (direct port of adrt::initDoublingStart):
+  //   exact extinction e_i = exp(-tau0/mu_i), exact single scattering,
+  //   Taylor double scattering tau0^2/2 * S^2, thermal source consistent with
+  //   the absorbed fraction of the operators (Kirchhoff) through O(tau0^2).
+  // Extinction and single scattering are exact for any tau0/mu, so the start
+  // never leaves the physical range (the former polynomial starts blew up for
+  // tau0 > mu_min under doubling).
   float half_tau0_sq = 0.5f * tau0 * tau0;
 
   GpuMatrix<N> R_k, T_k;
 
-  // T_k = I - tau0*Gpp
   #pragma unroll
-  for (int i = 0; i < N; ++i)
+  for (int i = 0; i < N; ++i) {
+    float inv_mu_i = 1.0f / d_mu[i];
+    float e_i = expf(-tau0 * inv_mu_i);
     #pragma unroll
-    for (int j = 0; j < N; ++j)
-      T_k(i, j) = ((i == j) ? 1.0f : 0.0f) - tau0 * Gpp(i, j);
-
-  // R_k = tau0*Gpm
-  mat_scale<N>(R_k, Gpm, tau0);
+    for (int j = 0; j < N; ++j) {
+      float inv_mu_j = 1.0f / d_mu[j];
+      float e_j = expf(-tau0 * inv_mu_j);
+      // T: int_0^tau0 exp(-(tau0-t)/mu_i) exp(-t/mu_j) dt ; R: int_0^tau0 exp(-t/mu_i) exp(-t/mu_j) dt
+      float int_T = doubling_path_integral(tau0, inv_mu_i - inv_mu_j, e_i, e_j);
+      float int_R = tau0 * doubling_phi(-tau0 * (inv_mu_i + inv_mu_j));
+      T_k(i, j) = ((i == j) ? e_i : 0.0f) + Spp(i, j) * int_T;
+      R_k(i, j) = Spm(i, j) * int_R;
+    }
+  }
 
   {
-    // Use a scoped temporary to add second-order corrections
+    // Taylor double scattering: T += h (Spp^2 + Spm^2), R += h (Spp Spm + Spm Spp)
     GpuMatrix<N> tmp;
 
-    // T_k += half_tau0_sq * Gpp²
-    mat_multiply<N>(tmp, Gpp, Gpp);
+    mat_multiply<N>(tmp, Spp, Spp);
     mat_add_inplace<N>(T_k, tmp, half_tau0_sq);
 
-    // T_k += half_tau0_sq * Gpm²
-    mat_multiply<N>(tmp, Gpm, Gpm);
+    mat_multiply<N>(tmp, Spm, Spm);
     mat_add_inplace<N>(T_k, tmp, half_tau0_sq);
 
-    // R_k -= half_tau0_sq * Gpp*Gpm
-    mat_multiply<N>(tmp, Gpp, Gpm);
-    mat_add_inplace<N>(R_k, tmp, -half_tau0_sq);
+    mat_multiply<N>(tmp, Spp, Spm);
+    mat_add_inplace<N>(R_k, tmp, half_tau0_sq);
 
-    // R_k -= half_tau0_sq * Gpm*Gpp
-    mat_multiply<N>(tmp, Gpm, Gpp);
-    mat_add_inplace<N>(R_k, tmp, -half_tau0_sq);
+    mat_multiply<N>(tmp, Spm, Spp);
+    mat_add_inplace<N>(R_k, tmp, half_tau0_sq);
   }
 
   // Initial source vectors
   GpuVec<N> y_k, z_k;
-  vec_set_zero<N>(z_k);
-  #pragma unroll
-  for (int i = 0; i < N; ++i)
-    y_k[i] = (1.0f - omega) * tau0 / d_mu[i];
-
   GpuVec<N> s_up_sol_k, s_down_sol_k;
   vec_set_zero<N>(s_up_sol_k);
   vec_set_zero<N>(s_down_sol_k);
 
+  #pragma unroll
+  for (int i = 0; i < N; ++i) {
+    float inv_mu_i = 1.0f / d_mu[i];
+    float x = tau0 * inv_mu_i;
+    float e_i = expf(-x);
+    float a_i = -expm1f(-x);            // 1 - e_i
+
+    // Kirchhoff-consistent emission: absorbed fraction of the start through O(tau0^2)
+    float d2 = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < N; ++k)
+      d2 += (Spp(i, k) + Spm(i, k)) / d_mu[k];
+
+    y_k[i] = (1.0f - omega) * (a_i + half_tau0_sq * d2);
+
+    // z_i = (1-omega) [ mu_i (1 - e_i) - tau0/2 (1 + e_i) ]  (= -(1-omega) mu_i x^3/12 + ...)
+    float slope = (x < 3e-2f)
+        ? d_mu[i] * x * x * x * (-1.0f / 12.0f + x * (1.0f / 24.0f - x / 80.0f))
+        : d_mu[i] * a_i - 0.5f * tau0 * (1.0f + e_i);
+    z_k[i] = (1.0f - omega) * slope;
+  }
+
   if (has_solar) {
+    float inv_mu0 = 1.0f / solar_mu;
+    float e_0 = expf(-tau0 * inv_mu0);
+
     #pragma unroll
     for (int i = 0; i < N; ++i) {
-      float base = omega * tau0 / d_mu[i] * F_top;
-      s_up_sol_k[i]   = base * (*p_minus_solar)[i];
-      s_down_sol_k[i] = base * (*p_plus_solar)[i];
+      float inv_mu_i = 1.0f / d_mu[i];
+      float e_i = expf(-tau0 * inv_mu_i);
+
+      // single scattering of the direct beam, attenuated along both legs
+      float int_up = tau0 * doubling_phi(-tau0 * (inv_mu0 + inv_mu_i));
+      float int_dn = doubling_path_integral(tau0, inv_mu_i - inv_mu0, e_i, e_0);
+
+      float src_up_i = omega * F_top * (*p_minus_solar)[i] * inv_mu_i;
+      float src_dn_i = omega * F_top * (*p_plus_solar)[i]  * inv_mu_i;
+
+      // Taylor double scattering
+      float d_up = 0.0f, d_dn = 0.0f;
+      #pragma unroll
+      for (int k = 0; k < N; ++k) {
+        float inv_mu_k = 1.0f / d_mu[k];
+        float src_up_k = omega * F_top * (*p_minus_solar)[k] * inv_mu_k;
+        float src_dn_k = omega * F_top * (*p_plus_solar)[k]  * inv_mu_k;
+        d_up += Spp(i, k) * src_up_k + Spm(i, k) * src_dn_k;
+        d_dn += Spp(i, k) * src_dn_k + Spm(i, k) * src_up_k;
+      }
+
+      s_up_sol_k[i]   = src_up_i * int_up + half_tau0_sq * d_up;
+      s_down_sol_k[i] = src_dn_i * int_dn + half_tau0_sq * d_dn;
     }
   }
 

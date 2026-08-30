@@ -1878,6 +1878,68 @@ static void test_raw_input_entry_point() {
 //  Main
 // ============================================================================
 
+// ============================================================================
+//  Weakly scattering layers (0 < omega < 0.1) -- regression guard for the
+//  doubling start. The former polynomial thin-layer starts left the physical
+//  range for tau0 > mu_min and blew up under doubling for omega < 0.1 (GPU
+//  ipow0 = 2/5); no test below used such an omega. Compares against the CPU
+//  solver (which has its own guard) at a tolerance far tighter than the
+//  0.5 absolute used elsewhere in this file.
+// ============================================================================
+
+void test_weak_scattering() {
+  std::cout << "  test_weak_scattering ... ";
+
+  char name[96];
+  for (int N : {8, 16}) {
+    for (double tau : {0.1, 1.0, 5.0, 20.0}) {
+      for (double om : {1e-8, 1e-4, 1e-3, 1e-2, 0.05, 0.5, 0.9}) {
+        // Thermal: two Rayleigh layers under cold space.
+        {
+          adrt::ADConfig cfg(2, N);
+          cfg.use_thermal_emission = true;
+          cfg.wavenumber_low = 1000.0;
+          cfg.wavenumber_high = 1001.0;
+          cfg.top_temperature = 0.0;
+          cfg.surface_albedo = 0.0;
+          cfg.allocate();
+          cfg.delta_tau[0] = 0.3 * tau;
+          cfg.delta_tau[1] = 0.7 * tau;
+          cfg.single_scat_albedo[0] = om;
+          cfg.single_scat_albedo[1] = om;
+          cfg.setRayleigh();
+          cfg.temperature = {900.0, 1000.0, 1100.0};
+
+          auto cpu = cpuSolve(cfg);
+          auto cuda = cudaSolveSingle(cfg);
+          snprintf(name, sizeof(name), "thermal F_up N=%d tau=%g omega=%.0e", N, tau, om);
+          CHECK_NEAR(name, cuda.flux_up, cpu.flux_up[0], 5e-4 * cpu.flux_up[0]);
+        }
+        // Solar beam: reflected flux is O(omega), so use a mixed tolerance.
+        {
+          adrt::ADConfig cfg(2, N);
+          cfg.solar_flux = 100.0;
+          cfg.solar_mu = 0.5;
+          cfg.surface_albedo = 0.0;
+          cfg.allocate();
+          cfg.delta_tau[0] = 0.3 * tau;
+          cfg.delta_tau[1] = 0.7 * tau;
+          cfg.single_scat_albedo[0] = om;
+          cfg.single_scat_albedo[1] = om;
+          cfg.setRayleigh();
+
+          auto cpu = cpuSolve(cfg);
+          auto cuda = cudaSolveSingle(cfg);
+          snprintf(name, sizeof(name), "solar F_up N=%d tau=%g omega=%.0e", N, tau, om);
+          CHECK_NEAR(name, cuda.flux_up, cpu.flux_up[0], 5e-4 * cpu.flux_up[0] + 1e-5);
+        }
+      }
+    }
+  }
+  std::cout << "done\n";
+}
+
+
 int main() {
   std::cout << "CUDA Adding-Doubling Solver Validation Tests\n";
   std::cout << "=============================================\n\n";
@@ -1934,6 +1996,7 @@ int main() {
   test_thermal_surface_temperature();
   test_thermal_top_temperature();
   test_thermal_hg_deltam();
+  test_weak_scattering();
 
   // Linear source (analytical)
   test_linear_source_pure_absorption();

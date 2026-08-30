@@ -9,6 +9,7 @@
 #include "cuda_quadrature.cuh"
 #include "cuda_planck.cuh"
 
+#include <algorithm>
 #include <cmath>
 
 namespace adrt {
@@ -148,15 +149,15 @@ __global__ void batchedPhaseMatrixKernel(
 /// Gpp(i,j) = (delta_ij - 2*omega*pi * Ppp(i,j)*wt[j]) / mu[i]
 /// Gpm(i,j) = 2*omega*pi * Ppm(i,j)*wt[j] / mu[i]
 /// Indexed: element [w * N*N + i*N + j]
-__global__ void batchedBuildGppGpmKernel(
+__global__ void batchedBuildSppSpmKernel(
     int nwav, int N,
     const float* __restrict__ Ppp_layer,  // [N*N] (shared across wavenumbers)
     const float* __restrict__ Ppm_layer,  // [N*N]
     const float* __restrict__ omega,      // [nwav] per-wavenumber omega
     const float* __restrict__ mu,         // [N]
     const float* __restrict__ wt,         // [N]
-    float* __restrict__ Gpp,              // [nwav * N * N]
-    float* __restrict__ Gpm)              // [nwav * N * N]
+    float* __restrict__ Spp,              // [nwav * N * N]  2 pi omega Ppp C / mu
+    float* __restrict__ Spm)              // [nwav * N * N]  2 pi omega Ppm C / mu
 {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int total = nwav * N * N;
@@ -172,24 +173,40 @@ __global__ void batchedBuildGppGpmKernel(
   float inv_mu = 1.0f / mu[i];
   float ppc = Ppp_layer[i * N + j] * wt[j];
   float pmc = Ppm_layer[i * N + j] * wt[j];
-  float delta_ij = (i == j) ? 1.0f : 0.0f;
 
-  Gpp[idx] = (delta_ij - con * ppc) * inv_mu;
-  Gpm[idx] = con * pmc * inv_mu;
+  Spp[idx] = con * ppc * inv_mu;
+  Spm[idx] = con * pmc * inv_mu;
 }
 
 
 // ============================================================================
-//  Second-order thin-layer initialization
+//  Thin-layer initialization (direct port of adrt::initDoublingStart)
 // ============================================================================
 
-/// T_k = I - tau0*Gpp, R_k = tau0*Gpm  (first order, applied element-wise)
-/// Second-order corrections added via cuBLAS GEMM calls from the host.
-__global__ void batchedFirstOrderInitKernel(
+/// phi(u) = expm1(u) / u, phi(0) = 1.
+__device__ __forceinline__ float batchedPhi(float u) {
+  return (fabsf(u) < 1e-6f) ? 1.0f + 0.5f * u : expm1f(u) / u;
+}
+
+/// int_0^tau0 exp(-(tau0-t)/mu_i) exp(-t/mu_j) dt = (e_j - e_i) / d, d = 1/mu_i - 1/mu_j.
+/// tau0 e_i phi(tau0 d) for small |tau0 d|, difference form otherwise (no overflow).
+__device__ __forceinline__ float batchedPathIntegral(float tau0, float d, float e_i, float e_j) {
+  float u = tau0 * d;
+  return (fabsf(u) < 1.0f) ? tau0 * e_i * batchedPhi(u) : (e_j - e_i) / d;
+}
+
+/// Exact extinction + exact single scattering:
+///   T(i,j) = delta_ij e_i + Spp(i,j) int_0^tau0 exp(-(tau0-t)/mu_i) exp(-t/mu_j) dt
+///   R(i,j) =                Spm(i,j) int_0^tau0 exp(-t/mu_i)        exp(-t/mu_j) dt
+/// The Taylor double-scattering terms (tau0^2/2 * S^2) are added afterwards
+/// via cuBLAS GEMMs from the host. Exact for any tau0/mu (never leaves the
+/// physical range, unlike the former polynomial starts).
+__global__ void batchedSingleScatterInitKernel(
     int nwav, int N,
     const float* __restrict__ tau0,   // [nwav]
-    const float* __restrict__ Gpp,    // [nwav * N*N]
-    const float* __restrict__ Gpm,    // [nwav * N*N]
+    const float* __restrict__ mu,     // [N]
+    const float* __restrict__ Spp,    // [nwav * N*N]
+    const float* __restrict__ Spm,    // [nwav * N*N]
     float* __restrict__ T_k,          // [nwav * N*N]
     float* __restrict__ R_k)          // [nwav * N*N]
 {
@@ -203,14 +220,20 @@ __global__ void batchedFirstOrderInitKernel(
   int j = rem % N;
 
   float t0 = tau0[w];
-  float delta_ij = (i == j) ? 1.0f : 0.0f;
+  float inv_mu_i = 1.0f / mu[i];
+  float inv_mu_j = 1.0f / mu[j];
+  float e_i = expf(-t0 * inv_mu_i);
+  float e_j = expf(-t0 * inv_mu_j);
 
-  T_k[idx] = delta_ij - t0 * Gpp[idx];
-  R_k[idx] = t0 * Gpm[idx];
+  float int_T = batchedPathIntegral(t0, inv_mu_i - inv_mu_j, e_i, e_j);
+  float int_R = t0 * batchedPhi(-t0 * (inv_mu_i + inv_mu_j));
+
+  T_k[idx] = ((i == j) ? e_i : 0.0f) + Spp[idx] * int_T;
+  R_k[idx] = Spm[idx] * int_R;
 }
 
-/// Add second-order correction: T_k += half_tau0^2 * tmp, or R_k -= half_tau0^2 * tmp
-/// Called after cuBLAS computes tmp = Gpp*Gpp, Gpm*Gpm, etc.
+/// Add Taylor double-scattering term: dst += sign * half_tau0^2 * src
+/// Called after cuBLAS computes src = Spp*Spp, Spm*Spm, Spp*Spm, Spm*Spp.
 __global__ void batchedAddScaledMatrixKernel(
     int nwav, int N,
     const float* __restrict__ half_tau0_sq, // [nwav]
@@ -304,15 +327,19 @@ __global__ void batchedBuildFloatPointerArrayKernel(
 //  Source vector initialization (doubling)
 // ============================================================================
 
-/// y_k[w*N+i] = (1 - omega) * tau0 / mu[i]
-/// z_k = 0
-/// Solar: s_up_sol[w*N+i] = omega * tau0 / mu[i] * F_top * p_minus[i]
-///        s_down_sol[w*N+i] = omega * tau0 / mu[i] * F_top * p_plus[i]
+/// Thermal source consistent with the absorbed fraction of the start (Kirchhoff)
+/// through O(tau0^2):
+///   y_k[i] = (1 - omega) [ (1 - e_i) + tau0^2/2 sum_k (Spp+Spm)(i,k) / mu_k ]
+///   z_k[i] = (1 - omega) [ mu_i (1 - e_i) - tau0/2 (1 + e_i) ]
+/// Solar: exact single scattering of the direct beam (attenuated along both
+/// legs) plus the Taylor double-scattering term.
 __global__ void batchedSourceInitKernel(
     int nwav, int N,
     const float* __restrict__ tau0,     // [nwav]
     const float* __restrict__ omega,    // [nwav]
     const float* __restrict__ mu,       // [N]
+    const float* __restrict__ Spp,      // [nwav * N*N]
+    const float* __restrict__ Spm,      // [nwav * N*N]
     float solar_flux, float solar_mu,
     const float* __restrict__ tau_above, // [nwav] cumulative tau above this layer
     bool has_solar,
@@ -345,16 +372,48 @@ __global__ void batchedSourceInitKernel(
 
   float t0 = tau0[w];
   float om = omega[w];
-  float inv_mu = 1.0f / mu[i];
+  float h = 0.5f * t0 * t0;
+  float inv_mu_i = 1.0f / mu[i];
+  float x = t0 * inv_mu_i;
+  float e_i = expf(-x);
+  float a_i = -expm1f(-x);            // 1 - e_i
 
-  y_k[idx] = (1.0f - om) * t0 * inv_mu;
-  z_k[idx] = 0.0f;
+  const float* Spp_row = Spp + (size_t)w * N * N + (size_t)i * N;
+  const float* Spm_row = Spm + (size_t)w * N * N + (size_t)i * N;
+
+  float d2 = 0.0f;
+  for (int k = 0; k < N; ++k)
+    d2 += (Spp_row[k] + Spm_row[k]) / mu[k];
+
+  y_k[idx] = (1.0f - om) * (a_i + h * d2);
+
+  float slope = (x < 3e-2f)
+      ? mu[i] * x * x * x * (-1.0f / 12.0f + x * (1.0f / 24.0f - x / 80.0f))
+      : mu[i] * a_i - 0.5f * t0 * (1.0f + e_i);
+  z_k[idx] = (1.0f - om) * slope;
 
   if (has_solar && solar_pp != nullptr) {
     float F_top = solar_flux * expf(-tau_above[w] / solar_mu);
-    float base_val = om * t0 * inv_mu * F_top;
-    s_up_sol[idx]   = base_val * solar_pm[i];
-    s_down_sol[idx] = base_val * solar_pp[i];
+    float inv_mu0 = 1.0f / solar_mu;
+    float e_0 = expf(-t0 * inv_mu0);
+
+    float int_up = t0 * batchedPhi(-t0 * (inv_mu0 + inv_mu_i));
+    float int_dn = batchedPathIntegral(t0, inv_mu_i - inv_mu0, e_i, e_0);
+
+    float src_up_i = om * F_top * solar_pm[i] * inv_mu_i;
+    float src_dn_i = om * F_top * solar_pp[i] * inv_mu_i;
+
+    float d_up = 0.0f, d_dn = 0.0f;
+    for (int k = 0; k < N; ++k) {
+      float inv_mu_k = 1.0f / mu[k];
+      float src_up_k = om * F_top * solar_pm[k] * inv_mu_k;
+      float src_dn_k = om * F_top * solar_pp[k] * inv_mu_k;
+      d_up += Spp_row[k] * src_up_k + Spm_row[k] * src_dn_k;
+      d_dn += Spp_row[k] * src_dn_k + Spm_row[k] * src_up_k;
+    }
+
+    s_up_sol[idx]   = src_up_i * int_up + h * d_up;
+    s_down_sol[idx] = src_dn_i * int_dn + h * d_dn;
   } else {
     s_up_sol[idx]   = 0.0f;
     s_down_sol[idx] = 0.0f;
@@ -831,12 +890,14 @@ __global__ void batchedComputeTau0Kernel(
   half_tau0_sq[w] = 0.5f * t0 * t0;
 }
 
-/// Compute nn_max across all wavenumbers (host-side reduction helper)
+/// Compute nn_max across all wavenumbers (host-side reduction helper).
+/// Mirrors adrt::computeDoublingCount with the GPU ipow0 values (2, 8, 12):
+/// omega-adaptive rule plus the extinction floor tau0 = tau / 2^nn <= mu_min / 2.
 inline int computeNnMax(const std::vector<float>& tau_host,
                         const std::vector<float>& omega_host,
-                        int nwav)
+                        int nwav, float mu_min)
 {
-  int nn_max = 2;
+  int nn_max = 1;
   for (int w = 0; w < nwav; ++w) {
     float t = tau_host[w];
     float om = omega_host[w];
@@ -844,11 +905,12 @@ inline int computeNnMax(const std::vector<float>& tau_host,
 
     int ipow0;
     if (om < 0.01f) ipow0 = 2;
-    else if (om < 0.1f) ipow0 = 5;
-    else ipow0 = 8;
+    else if (om < 0.1f) ipow0 = 8;
+    else ipow0 = 12;
 
     int nn = static_cast<int>(logf(t) / logf(2.0f)) + ipow0;
-    if (nn < 2) nn = 2;
+    int n_ext = static_cast<int>(ceilf(log2f(t / mu_min))) + 1;
+    nn = std::max(1, std::max(nn, n_ext));
     if (nn > nn_max) nn_max = nn;
   }
   return nn_max;

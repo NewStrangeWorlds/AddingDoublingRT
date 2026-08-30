@@ -1051,24 +1051,20 @@ static DynLayerMatrices dynDoubling(
     std::vector<double>(weights.begin(), 
     weights.end()));
 
+  // Scattering operators Spp = 2 pi omega Ppp C / mu,  Spm = 2 pi omega Ppm C / mu
   DynamicMatrix PppC = Ppp.multiply(C);
-  DynamicMatrix temp = I.add(PppC, -con);
-  DynamicMatrix Gpp(n);
-  
-  for (int i = 0; i < n; ++i)
-    for (int j = 0; j < n; ++j)
-      Gpp(i, j) = temp(i, j) / mu[i];
-
   DynamicMatrix PpmC = Ppm.multiply(C);
-  DynamicMatrix Gpm(n);
+  DynamicMatrix Spp(n), Spm(n);
   
   for (int i = 0; i < n; ++i)
-    for (int j = 0; j < n; ++j)
-      Gpm(i, j) = con * PpmC(i, j) / mu[i];
+    for (int j = 0; j < n; ++j) 
+    {
+      Spp(i, j) = con * PppC(i, j) / mu[i];
+      Spm(i, j) = con * PpmC(i, j) / mu[i];
+    }
 
-  int nn = static_cast<int>(std::log(tau) / std::log(2.0)) + computeIpow0(omega);
-  
-  if (nn < 1) nn = 1;
+  const double mu_min = *std::min_element(mu.begin(), mu.begin() + n);
+  int nn = computeDoublingCount(tau, omega, mu_min);
   
   double xfac_d = 1.0 / std::pow(2.0, nn);
   double tau0 = tau * xfac_d;
@@ -1078,30 +1074,14 @@ static DynLayerMatrices dynDoubling(
   double F_top = has_solar ? solar_flux * std::exp(-tau_cumulative / solar_mu) : 0.0;
 
   DynamicMatrix R_k(n), T_k(n);
-  
-  for (int i = 0; i < n; ++i) 
-  {
-    for (int j = 0; j < n; ++j) {
-      T_k(i, j) = ((i == j) ? 1.0 : 0.0) - tau0 * Gpp(i, j);
-      R_k(i, j) = tau0 * Gpm(i, j);
-    }
-  }
+  std::vector<double> y_k(n), z_k(n);
+  std::vector<double> s_up_sol_k(n), s_down_sol_k(n);
 
-  std::vector<double> y_k(n), z_k(n, 0.0);
-  
-  for (int i = 0; i < n; ++i)
-    y_k[i] = (1.0 - omega) * tau0 / mu[i];
-
-  std::vector<double> s_up_sol_k(n, 0.0), s_down_sol_k(n, 0.0);
-  
-  if (has_solar) 
-  {
-    for (int i = 0; i < n; ++i) {
-      double base = omega * tau0 / mu[i] * F_top;
-      s_up_sol_k[i]   = base * p_minus_solar[i];
-      s_down_sol_k[i] = base * p_plus_solar[i];
-    }
-  }
+  initDoublingStart(R_k, T_k, y_k, z_k, s_up_sol_k, s_down_sol_k,
+                    n, tau0, omega, Spp, Spm, mu,
+                    has_solar, F_top, solar_mu,
+                    has_solar ? p_plus_solar.data() : nullptr,
+                    has_solar ? p_minus_solar.data() : nullptr);
 
   double g_k = 0.5 * tau0;
   double gamma_sol = has_solar ? std::exp(-tau0 / solar_mu) : 0.0;

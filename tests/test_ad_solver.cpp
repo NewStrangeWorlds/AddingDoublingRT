@@ -14,6 +14,9 @@
 #include "testing.hpp"
 #include "adding_doubling.hpp"
 #include "constants.hpp"
+#include "doubling.hpp"
+#include "phase_matrix.hpp"
+#include "quadrature.hpp"
 
 #include <cmath>
 #include <vector>
@@ -2206,3 +2209,171 @@ TEST(ADSolver, DeltaM_BackwardCompat) {
   EXPECT_NEAR(r1.flux_up[0], r2.flux_up[0], 1e-14);
   EXPECT_NEAR(r1.flux_down[1], r2.flux_down[1], 1e-14);
 }
+
+
+// ============================================================================
+//  Doubling start and doubling count: weakly scattering layers (0 < omega < 0.1)
+//
+//  Regression guard for the former first-order thin-layer start, whose
+//  transmission diagonal 1 - tau0/mu went negative for tau0 > mu_min and blew
+//  up under doubling for every layer with omega < 0.01 (ipow0 = 4). No test
+//  below exercised 0 < omega < 0.1 before, and omega = 0 takes the analytic
+//  pure-absorption branch, so the failure was invisible to the DISORT
+//  cross-validation.
+// ============================================================================
+
+namespace {
+
+template<int N>
+struct DoublingFixture {
+  std::vector<double> mu, wt;
+  adrt::Matrix<N> Ppp, Ppm;
+  typename adrt::Matrix<N>::EigenVec p_plus, p_minus;
+
+  explicit DoublingFixture(bool rayleigh = false, double solar_mu = 0.5) {
+    adrt::gaussLegendre(N, mu, wt);
+    std::vector<double> chi = rayleigh ? std::vector<double>{1.0, 0.0, 0.1}
+                                       : std::vector<double>{1.0};
+    adrt::computePhaseMatricesFromLegendreImpl<N>(chi, mu, wt, Ppp, Ppm);
+    adrt::computeSolarPhaseVectorsImpl<N>(chi, mu, wt, solar_mu, p_plus, p_minus);
+  }
+
+  double mu_min() const { return *std::min_element(mu.begin(), mu.end()); }
+};
+
+/// Hemispheric-flux weighted rows of an operator: sum_j w_j mu_j X(i,j).
+template<int N>
+double fluxRow(const adrt::Matrix<N>& X, int i,
+               const std::vector<double>& mu, const std::vector<double>& wt) {
+  double s = 0.0;
+  for (int j = 0; j < N; ++j) s += wt[j] * mu[j] * X(i, j);
+  return s;
+}
+
+template<int N>
+void checkContinuityAtZeroAlbedo(double tau, double omega) {
+  DoublingFixture<N> fx(true);
+  auto L0 = adrt::doubling<N>(tau, 0.0,   1.0, 2.0, fx.Ppp, fx.Ppm, fx.mu, fx.wt);
+  auto L  = adrt::doubling<N>(tau, omega, 1.0, 2.0, fx.Ppp, fx.Ppm, fx.mu, fx.wt);
+
+  // The physical effect of omega is O(omega); anything larger is a start/count error.
+  const double tol = 10.0 * omega + 1e-12;
+
+  for (int i = 0; i < N; ++i) {
+    EXPECT_NEAR(L.s_up[i],   L0.s_up[i],   tol);
+    EXPECT_NEAR(L.s_down[i], L0.s_down[i], tol);
+    for (int j = 0; j < N; ++j) {
+      EXPECT_NEAR(L.T_ab(i, j), L0.T_ab(i, j), tol);
+      EXPECT_NEAR(L.R_ab(i, j), L0.R_ab(i, j), tol);
+    }
+  }
+}
+
+} // namespace
+
+TEST(Doubling, ContinuousAtZeroAlbedo_N8) {
+  for (double tau : {0.1, 1.0, 5.0, 20.0})
+    for (double omega : {1e-9, 1e-6, 1e-4, 1e-2})
+      checkContinuityAtZeroAlbedo<8>(tau, omega);
+}
+
+TEST(Doubling, ContinuousAtZeroAlbedo_N16) {
+  for (double tau : {0.1, 1.0, 5.0, 20.0})
+    for (double omega : {1e-9, 1e-6, 1e-4, 1e-2})
+      checkContinuityAtZeroAlbedo<16>(tau, omega);
+}
+
+TEST(Doubling, CountRuleIsConverged) {
+  // The layer operators and sources at the rule-selected doubling count must
+  // agree with a much finer start (8 more doublings) to a few 1e-5 in
+  // flux-weighted quantities, for weak, moderate and conservative scattering.
+  DoublingFixture<8> fx(true, 0.5);
+  const double B_top = 1.0, B_bot = 1.5;
+  const double F0 = 1.0, mu0 = 0.5;
+
+  for (double tau : {0.1, 1.0, 5.0, 20.0}) {
+    for (double omega : {1e-6, 1e-3, 0.05, 0.5, 0.9, 0.999, 1.0}) {
+      const int nn = adrt::computeDoublingCount(tau, omega, fx.mu_min());
+      auto L   = adrt::doubling<8>(tau, omega, B_top, B_bot, fx.Ppp, fx.Ppm, fx.mu, fx.wt,
+                                   F0, mu0, 0.0, &fx.p_plus, &fx.p_minus, nn);
+      auto ref = adrt::doubling<8>(tau, omega, B_top, B_bot, fx.Ppp, fx.Ppm, fx.mu, fx.wt,
+                                   F0, mu0, 0.0, &fx.p_plus, &fx.p_minus, nn + 8);
+
+      const double tol = 3e-5;
+      for (int i = 0; i < 8; ++i) {
+        EXPECT_NEAR(fluxRow<8>(L.T_ab, i, fx.mu, fx.wt), fluxRow<8>(ref.T_ab, i, fx.mu, fx.wt), tol);
+        EXPECT_NEAR(fluxRow<8>(L.R_ab, i, fx.mu, fx.wt), fluxRow<8>(ref.R_ab, i, fx.mu, fx.wt), tol);
+        EXPECT_NEAR(L.s_up[i],         ref.s_up[i],         tol);
+        EXPECT_NEAR(L.s_down[i],       ref.s_down[i],       tol);
+        EXPECT_NEAR(L.s_up_solar[i],   ref.s_up_solar[i],   tol);
+        EXPECT_NEAR(L.s_down_solar[i], ref.s_down_solar[i], tol);
+      }
+    }
+  }
+}
+
+TEST(Doubling, StartRespectsExtinctionFloor) {
+  // tau0 = tau / 2^nn must not exceed mu_min / 2 for any omega.
+  for (int N : {4, 8, 16, 32}) {
+    std::vector<double> mu, wt;
+    adrt::gaussLegendre(N, mu, wt);
+    double mu_min = *std::min_element(mu.begin(), mu.end());
+    for (double tau : {0.01, 0.1, 1.0, 5.0, 20.0, 200.0})
+      for (double omega : {1e-8, 1e-3, 0.05, 0.5, 1.0}) {
+        int nn = adrt::computeDoublingCount(tau, omega, mu_min);
+        EXPECT_TRUE(tau / std::pow(2.0, nn) <= 0.5 * mu_min + 1e-15);
+        // ... and never fewer doublings than the omega rule alone.
+        EXPECT_TRUE(nn >= std::max(1, static_cast<int>(std::log(tau) / std::log(2.0))
+                                        + adrt::computeIpow0(omega)));
+      }
+  }
+}
+
+namespace {
+
+/// 60-layer brown-dwarf-like column: cumulative tau log-spaced 1e-4..1e3,
+/// T from 500 K to 3000 K, Rayleigh phase function, cold space at the top.
+adrt::RTOutput solveWeakScatteringColumn(double omega, int nquad) {
+  const int nl = 60;
+  adrt::ADConfig cfg(nl, nquad);
+  cfg.use_thermal_emission = true;
+  cfg.surface_albedo = 0.0;
+  cfg.top_temperature = 0.0;
+  cfg.wavenumber_low = 1000.0;
+  cfg.wavenumber_high = 1001.0;
+  cfg.allocate();
+
+  std::vector<double> tcum(nl + 1);
+  for (int l = 0; l <= nl; ++l) tcum[l] = std::pow(10.0, -4.0 + 7.0 * l / nl);
+  for (int l = 0; l < nl; ++l) {
+    cfg.delta_tau[l] = tcum[l + 1] - tcum[l];
+    cfg.single_scat_albedo[l] = omega;
+  }
+  cfg.setRayleigh();
+  for (int l = 0; l <= nl; ++l)
+    cfg.temperature[l] = 500.0 + 2500.0 * (std::log10(tcum[l]) + 4.0) / 7.0;
+
+  return adrt::solve(cfg);
+}
+
+void checkWeakScatteringColumn(int nquad) {
+  auto r0 = solveWeakScatteringColumn(0.0, nquad);
+  auto r6 = solveWeakScatteringColumn(1e-6, nquad);
+  auto r3 = solveWeakScatteringColumn(1e-3, nquad);
+
+  for (size_t l = 0; l < r0.flux_up.size(); ++l) {
+    const double scale = r0.flux_up[l];
+    // omega = 1e-6: physically indistinguishable from pure absorption at 1e-5.
+    EXPECT_NEAR(r6.flux_up[l],   r0.flux_up[l],   1e-5 * scale);
+    EXPECT_NEAR(r6.flux_down[l], r0.flux_down[l], 1e-5 * scale);
+    // omega = 1e-3: differences of order omega, never more.
+    EXPECT_NEAR(r3.flux_up[l],   r0.flux_up[l],   5e-3 * scale);
+    EXPECT_NEAR(r3.flux_down[l], r0.flux_down[l], 5e-3 * scale);
+  }
+}
+
+} // namespace
+
+TEST(ADSolver, WeakScatteringColumn_N8)  { checkWeakScatteringColumn(8); }
+TEST(ADSolver, WeakScatteringColumn_N12) { checkWeakScatteringColumn(12); }   // dynamic-size path
+TEST(ADSolver, WeakScatteringColumn_N16) { checkWeakScatteringColumn(16); }

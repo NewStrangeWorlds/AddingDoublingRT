@@ -13,6 +13,7 @@ import numpy as np
 
 from .quadrature import gauss_legendre, precompute_legendre_polynomials
 from .phase_matrix import compute_phase_matrices, compute_solar_phase_vectors
+from .doubling import doubling_start
 
 PI = jnp.pi
 
@@ -167,27 +168,21 @@ def _solve_core(nlay, N, nn_max, has_surface,
         PppC = PppC_all[layer_idx]
         PpmC = PpmC_all[layer_idx]
 
-        Gpp = (I_mat[None] - con[:, None, None] * PppC[None]) / mu[None, :, None]
-        Gpm = con[:, None, None] * PpmC[None] / mu[None, :, None]
+        Spp = con[:, None, None] * PppC[None] / mu[None, :, None]
+        Spm = con[:, None, None] * PpmC[None] / mu[None, :, None]
 
         tau0 = tau_l / (2.0 ** nn_max)
-
-        # Initial thermal state
-        R_k = tau0[:, None, None] * Gpm
-        T_k = I_mat[None] - tau0[:, None, None] * Gpp
-        y_k = (1.0 - omega_clipped)[:, None] * tau0[:, None] / mu[None, :]
-        z_k = jnp.zeros_like(y_k)
         g_k = 0.5 * tau0
 
-        # Initial solar state
+        # Initial state (exact extinction + single scattering, Taylor double scattering)
         tau_cum_l = tau_cum[:, layer_idx]
         F_top = solar_flux * jnp.exp(-tau_cum_l / jnp.maximum(solar_mu, 1e-30))
         p_plus = p_plus_solar_all[layer_idx]    # (N,)
         p_minus = p_minus_solar_all[layer_idx]   # (N,)
 
-        base = omega_clipped[:, None] * tau0[:, None] / mu[None, :] * F_top[:, None]
-        s_up_sol = base * p_minus[None, :]
-        s_down_sol = base * p_plus[None, :]
+        R_k, T_k, y_k, z_k, s_up_sol, s_down_sol = doubling_start(
+            tau0, omega_clipped, Spp, Spm, mu,
+            F_top, p_plus, p_minus, jnp.maximum(solar_mu, 1e-30))
         gamma_sol = jnp.exp(-tau0 / jnp.maximum(solar_mu, 1e-30))
 
         # Doubling iterations
@@ -372,21 +367,18 @@ def _solve_core_map(nlay, N, nn_max, has_surface,
             omega_c = jnp.clip(omega_l, 0.0, 1.0)
             con = 2.0 * omega_c * PI
 
-            Gpp = (I_mat - con * PppC_all[layer_idx]) / mu[:, None]
-            Gpm = con * PpmC_all[layer_idx] / mu[:, None]
+            Spp = con * PppC_all[layer_idx] / mu[:, None]
+            Spm = con * PpmC_all[layer_idx] / mu[:, None]
 
             tau0 = tau_l / (2.0 ** nn_max)
-            R_k  = tau0 * Gpm
-            T_k  = I_mat - tau0 * Gpp
-            y_k  = (1.0 - omega_c) * tau0 / mu
-            z_k  = zero_vec
             g_k  = 0.5 * tau0   # scalar
 
             F_top = solar_flux * jnp.exp(
                 -tau_cum_1[layer_idx] / jnp.maximum(solar_mu, 1e-30))
-            base       = omega_c * tau0 / mu * F_top
-            s_up_sol   = base * p_minus_solar_all[layer_idx]
-            s_down_sol = base * p_plus_solar_all[layer_idx]
+            R_k, T_k, y_k, z_k, s_up_sol, s_down_sol = doubling_start(
+                tau0, omega_c, Spp, Spm, mu,
+                F_top, p_plus_solar_all[layer_idx], p_minus_solar_all[layer_idx],
+                jnp.maximum(solar_mu, 1e-30))
             gamma_sol  = jnp.exp(-tau0 / jnp.maximum(solar_mu, 1e-30))  # scalar
 
             def doubling_1(carry, _):
@@ -483,19 +475,24 @@ class BatchConfig:
         self.solar_mu = 1.0
 
 
-def _compute_nn_max(delta_tau, ssa):
-    """Compute max doubling iterations across all wavenumbers and layers."""
+def _compute_nn_max(delta_tau, ssa, mu_min):
+    """Compute max doubling iterations across all wavenumbers and layers.
+
+    Omega-adaptive rule plus the extinction floor tau0 = tau / 2**nn <= mu_min / 2
+    (mirrors adrt::computeDoublingCount).
+    """
     tau_flat = np.asarray(delta_tau).ravel()
     omega_flat = np.asarray(ssa).ravel()
     # Filter to scattering entries only
-    mask = omega_flat > 0.0
+    mask = (omega_flat > 0.0) & (tau_flat > 0.0)
     if not np.any(mask):
         return 1
     tau_s = tau_flat[mask]
     omega_s = omega_flat[mask]
     ipow0 = np.where(omega_s < 0.01, 4, np.where(omega_s < 0.1, 10, 16))
-    nn = np.maximum(1, (np.log(np.maximum(tau_s, 1e-30)) / np.log(2.0)).astype(int) + ipow0)
-    return int(np.max(nn))
+    nn = (np.log(tau_s) / np.log(2.0)).astype(int) + ipow0
+    n_ext = np.ceil(np.log2(tau_s / mu_min)).astype(int) + 1
+    return int(max(1, np.max(nn), np.max(n_ext)))
 
 
 def solve_batch(config, delta_tau, ssa, phase_moments, planck_levels, use_map=False):
@@ -552,7 +549,7 @@ def solve_batch(config, delta_tau, ssa, phase_moments, planck_levels, use_map=Fa
     p_plus_all = jnp.stack(p_plus_list).astype(jnp.float32)   # (nlay, N)
     p_minus_all = jnp.stack(p_minus_list).astype(jnp.float32) # (nlay, N)
 
-    nn_max = _compute_nn_max(delta_tau, ssa)
+    nn_max = _compute_nn_max(delta_tau, ssa, float(np.min(np.asarray(mu))))
     has_surface = config.surface_albedo > 0.0 or float(np.max(planck_levels[:, -1])) > 0.0
 
     mu = mu.astype(jnp.float32)

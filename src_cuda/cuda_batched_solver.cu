@@ -45,7 +45,7 @@ struct BatchedWorkspace {
   float *comb_s_up, *comb_s_down, *comb_s_up_solar, *comb_s_down_solar;
 
   // Doubling temporaries
-  float *Gpp, *Gpm;           // [nwav * N*N]
+  float *Spp, *Spm;           // [nwav * N*N]
   float *R_k, *T_k;           // [nwav * N*N]
   float *tempA, *tempB;       // [nwav * N*N] scratch matrices
   float *tempC;               // [nwav * N*N] extra scratch
@@ -143,7 +143,7 @@ static void allocateWorkspace(BatchedWorkspace& ws, int N, int nwav, int nlay, i
   mf(&ws.comb_s_up_solar, vec_bytes); mf(&ws.comb_s_down_solar, vec_bytes);
 
   // Doubling matrices
-  mf(&ws.Gpp, mat_bytes); mf(&ws.Gpm, mat_bytes);
+  mf(&ws.Spp, mat_bytes); mf(&ws.Spm, mat_bytes);
   mf(&ws.R_k, mat_bytes); mf(&ws.T_k, mat_bytes);
   mf(&ws.tempA, mat_bytes); mf(&ws.tempB, mat_bytes);
   mf(&ws.tempC, mat_bytes);
@@ -219,7 +219,7 @@ static void freeWorkspace(BatchedWorkspace& ws) {
   cf(ws.cur_s_up); cf(ws.cur_s_down); cf(ws.cur_s_up_solar); cf(ws.cur_s_down_solar);
   cf(ws.comb_R_ab); cf(ws.comb_R_ba); cf(ws.comb_T_ab); cf(ws.comb_T_ba);
   cf(ws.comb_s_up); cf(ws.comb_s_down); cf(ws.comb_s_up_solar); cf(ws.comb_s_down_solar);
-  cf(ws.Gpp); cf(ws.Gpm); cf(ws.R_k); cf(ws.T_k);
+  cf(ws.Spp); cf(ws.Spm); cf(ws.R_k); cf(ws.T_k);
   cf(ws.tempA); cf(ws.tempB); cf(ws.tempC);
   cf(ws.y_k); cf(ws.z_k); cf(ws.y_k2); cf(ws.z_k2);
   cf(ws.s_up_sol); cf(ws.s_down_sol);
@@ -435,48 +435,48 @@ static void batchedDoubling(BatchedWorkspace& ws, cudaStream_t stream,
 
   using namespace batched;
 
-  // Build Gpp, Gpm
-  batchedBuildGppGpmKernel<<<divUp(mat_total, BLOCK), BLOCK, 0, stream>>>(
+  // Build Spp, Spm
+  batchedBuildSppSpmKernel<<<divUp(mat_total, BLOCK), BLOCK, 0, stream>>>(
       nwav, N,
       ws.phase_Ppp + (size_t)layer_idx * N * N,
       ws.phase_Ppm + (size_t)layer_idx * N * N,
       ws.omega_scaled,
       ws.d_mu_rt, ws.d_wt_rt,
-      ws.Gpp, ws.Gpm);
+      ws.Spp, ws.Spm);
 
   // Compute tau0 and half_tau0_sq
   batchedComputeTau0Kernel<<<divUp(nwav, BLOCK), BLOCK, 0, stream>>>(
       nwav, ws.tau_scaled, ws.omega_scaled, nn_max,
       ws.tau0, ws.half_tau0_sq);
 
-  // First-order thin-layer init: T_k = I - tau0*Gpp, R_k = tau0*Gpm
-  batchedFirstOrderInitKernel<<<divUp(mat_total, BLOCK), BLOCK, 0, stream>>>(
-      nwav, N, ws.tau0, ws.Gpp, ws.Gpm, ws.T_k, ws.R_k);
+  // Thin-layer init: exact extinction + exact single scattering
+  batchedSingleScatterInitKernel<<<divUp(mat_total, BLOCK), BLOCK, 0, stream>>>(
+      nwav, N, ws.tau0, ws.d_mu_rt, ws.Spp, ws.Spm, ws.T_k, ws.R_k);
 
-  // Second-order corrections via cuBLAS
-  // T_k += half_tau0_sq * Gpp²
-  batchedGemm(ws.handle, N, nwav, ws.Gpp, ws.Gpp, ws.tempA, 1.0f, 0.0f, stream);
+  // Taylor double-scattering terms via cuBLAS
+  // T_k += half_tau0_sq * Spp²
+  batchedGemm(ws.handle, N, nwav, ws.Spp, ws.Spp, ws.tempA, 1.0f, 0.0f, stream);
   batchedAddScaledMatrixKernel<<<divUp(mat_total, BLOCK), BLOCK, 0, stream>>>(
       nwav, N, ws.half_tau0_sq, 1.0f, ws.tempA, ws.T_k);
 
-  // T_k += half_tau0_sq * Gpm²
-  batchedGemm(ws.handle, N, nwav, ws.Gpm, ws.Gpm, ws.tempA, 1.0f, 0.0f, stream);
+  // T_k += half_tau0_sq * Spm²
+  batchedGemm(ws.handle, N, nwav, ws.Spm, ws.Spm, ws.tempA, 1.0f, 0.0f, stream);
   batchedAddScaledMatrixKernel<<<divUp(mat_total, BLOCK), BLOCK, 0, stream>>>(
       nwav, N, ws.half_tau0_sq, 1.0f, ws.tempA, ws.T_k);
 
-  // R_k -= half_tau0_sq * Gpp*Gpm
-  batchedGemm(ws.handle, N, nwav, ws.Gpp, ws.Gpm, ws.tempA, 1.0f, 0.0f, stream);
+  // R_k += half_tau0_sq * Spp*Spm
+  batchedGemm(ws.handle, N, nwav, ws.Spp, ws.Spm, ws.tempA, 1.0f, 0.0f, stream);
   batchedAddScaledMatrixKernel<<<divUp(mat_total, BLOCK), BLOCK, 0, stream>>>(
-      nwav, N, ws.half_tau0_sq, -1.0f, ws.tempA, ws.R_k);
+      nwav, N, ws.half_tau0_sq, 1.0f, ws.tempA, ws.R_k);
 
-  // R_k -= half_tau0_sq * Gpm*Gpp
-  batchedGemm(ws.handle, N, nwav, ws.Gpm, ws.Gpp, ws.tempA, 1.0f, 0.0f, stream);
+  // R_k += half_tau0_sq * Spm*Spp
+  batchedGemm(ws.handle, N, nwav, ws.Spm, ws.Spp, ws.tempA, 1.0f, 0.0f, stream);
   batchedAddScaledMatrixKernel<<<divUp(mat_total, BLOCK), BLOCK, 0, stream>>>(
-      nwav, N, ws.half_tau0_sq, -1.0f, ws.tempA, ws.R_k);
+      nwav, N, ws.half_tau0_sq, 1.0f, ws.tempA, ws.R_k);
 
   // Source init
   batchedSourceInitKernel<<<divUp(vec_total, BLOCK), BLOCK, 0, stream>>>(
-      nwav, N, ws.tau0, ws.omega_scaled, ws.d_mu_rt,
+      nwav, N, ws.tau0, ws.omega_scaled, ws.d_mu_rt, ws.Spp, ws.Spm,
       solar_flux, solar_mu, tau_above,
       has_solar,
       has_solar ? ws.phase_solar_pp + (size_t)layer_idx * N : nullptr,
@@ -732,7 +732,8 @@ __global__ void batchedComputeTauTotalKernel(
 
 /// Compute nn_max for a specific layer by reading omega values from device
 static int computeLayerNnMax(const float* d_omega_layer, int nwav,
-                              const float* d_tau_layer, cudaStream_t stream)
+                             const float* d_tau_layer, float mu_min,
+                             cudaStream_t stream)
 {
   // Copy to host for analysis
   std::vector<float> omega_host(nwav), tau_host(nwav);
@@ -742,7 +743,7 @@ static int computeLayerNnMax(const float* d_omega_layer, int nwav,
                   cudaMemcpyDeviceToHost, stream);
   cudaStreamSynchronize(stream);
 
-  return batched::computeNnMax(tau_host, omega_host, nwav);
+  return batched::computeNnMax(tau_host, omega_host, nwav, mu_min);
 }
 
 
@@ -864,6 +865,12 @@ void solveBatchedCublas(
   int nn_max_global;
   std::vector<char> layer_pure_abs(nlay, 0);
   {
+    float mu_min;
+    {
+      std::vector<double> mu_q, wt_q;
+      hostGaussLegendre(N, mu_q, wt_q);
+      mu_min = static_cast<float>(*std::min_element(mu_q.begin(), mu_q.end()));
+    }
     std::vector<float> all_tau(nwav * nlay), all_omega(nwav * nlay);
     cudaMemcpyAsync(all_tau.data(), data.delta_tau, nwav * nlay * sizeof(float),
                     cudaMemcpyDeviceToHost, stream);
@@ -882,7 +889,7 @@ void solveBatchedCublas(
         if (omega_l[w] > 0.0f) pure_abs = false;
       }
       layer_pure_abs[l] = pure_abs ? 1 : 0;
-      int nn = batched::computeNnMax(tau_l, omega_l, nwav);
+      int nn = batched::computeNnMax(tau_l, omega_l, nwav, mu_min);
       nn_max_global = std::max(nn_max_global, nn);
     }
   }

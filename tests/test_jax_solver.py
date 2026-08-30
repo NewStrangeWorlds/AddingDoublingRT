@@ -1597,5 +1597,105 @@ class TestSolverValidation:
             solve(cfg)
 
 
+# ============================================================================
+#  Weakly scattering layers (0 < omega < 0.1) -- regression guard for the
+#  doubling start. The former first-order start T = I - tau0*Gpp left the
+#  physical range for tau0 > mu_min and blew up under doubling for every
+#  omega < 0.01 layer; no test above used 0 < omega < 0.1, and omega = 0 takes
+#  the analytic pure-absorption branch.
+# ============================================================================
+
+def _weak_scattering_column(omega, nquad=8, nl=60):
+    """60-layer column: cumulative tau 1e-4..1e3, T 500..3000 K, Rayleigh, cold top."""
+    cfg = ADConfig(num_layers=nl, num_quadrature=nquad)
+    cfg.use_thermal_emission = True
+    cfg.surface_albedo = 0.0
+    cfg.top_temperature = 0.0
+    cfg.wavenumber_low = 1000.0
+    cfg.wavenumber_high = 1001.0
+    cfg.allocate()
+    tcum = 10.0 ** (-4.0 + 7.0 * np.arange(nl + 1) / nl)
+    for l in range(nl):
+        cfg.delta_tau[l] = tcum[l + 1] - tcum[l]
+        cfg.single_scat_albedo[l] = omega
+    cfg.set_rayleigh()
+    for l in range(nl + 1):
+        cfg.temperature[l] = 500.0 + 2500.0 * (np.log10(tcum[l]) + 4.0) / 7.0
+    return cfg
+
+
+class TestWeakScattering:
+    def test_single_layer_continuous_at_zero_albedo(self):
+        """TOA flux of a Rayleigh layer under cold space must be continuous at omega -> 0."""
+        for nquad in (8, 16):
+            for tau in (0.1, 1.0, 5.0, 20.0):
+                ref = None
+                for omega in (0.0, 1e-8, 1e-4, 1e-2):
+                    cfg = ADConfig(num_layers=1, num_quadrature=nquad)
+                    cfg.use_thermal_emission = True
+                    cfg.top_temperature = 0.0
+                    cfg.wavenumber_low = 1000.0
+                    cfg.wavenumber_high = 1001.0
+                    cfg.allocate()
+                    cfg.delta_tau[0] = tau
+                    cfg.single_scat_albedo[0] = omega
+                    cfg.set_rayleigh()
+                    cfg.temperature[0] = 1000.0
+                    cfg.temperature[1] = 1000.0
+                    f = float(solve(cfg).flux_up[0])
+                    if ref is None:
+                        ref = f
+                    else:
+                        # physical effect is O(omega); anything larger is a start/count error
+                        assert abs(f - ref) <= (10.0 * omega + 1e-7) * ref, (nquad, tau, omega, f, ref)
+
+    def test_column_matches_pure_absorption(self):
+        for nquad in (8, 16):
+            r0 = solve(_weak_scattering_column(0.0, nquad))
+            r6 = solve(_weak_scattering_column(1e-6, nquad))
+            r3 = solve(_weak_scattering_column(1e-3, nquad))
+            f0u, f0d = np.asarray(r0.flux_up), np.asarray(r0.flux_down)
+            np.testing.assert_allclose(np.asarray(r6.flux_up), f0u, rtol=1e-5)
+            np.testing.assert_allclose(np.asarray(r6.flux_down), f0d, rtol=1e-5, atol=1e-5 * f0u.max())
+            np.testing.assert_allclose(np.asarray(r3.flux_up), f0u, rtol=5e-3)
+            np.testing.assert_allclose(np.asarray(r3.flux_down), f0d, rtol=5e-3, atol=5e-3 * f0u.max())
+
+    def test_batch_solver_matches_pure_absorption(self):
+        """solve_batch (float32 batched path): weakly scattering column vs omega = 0.
+
+        Pinned to the CPU device: as of JAX 0.6.2 the batched core returns
+        wrong (deterministic) fluxes on the GPU backend for batches mixing
+        scattering and non-scattering wavenumbers, independently of the
+        doubling start (verified against the pre-2026-08 code). The CPU
+        platform agrees with the C++ solver to float32 accuracy.
+        """
+        import jax
+        from src_jax.batch_solver import BatchConfig, solve_batch
+        with jax.default_device(jax.devices("cpu")[0]):
+            self._run_batch_column(BatchConfig, solve_batch)
+
+    @staticmethod
+    def _run_batch_column(BatchConfig, solve_batch):
+        nl = 60
+        omegas = [0.0, 1e-6, 1e-3]
+        bc = BatchConfig()
+        bc.num_wavenumbers = len(omegas)
+        bc.num_layers = nl
+        bc.num_quadrature = 8
+        bc.num_moments_max = 16
+        bc.surface_albedo = 0.0
+        tcum = 10.0 ** (-4.0 + 7.0 * np.arange(nl + 1) / nl)
+        dtau = np.tile(np.diff(tcum), (len(omegas), 1))
+        ssa = np.array([[om] * nl for om in omegas])
+        pmom = np.zeros((nl, 16)); pmom[:, 0] = 1.0; pmom[:, 2] = 0.1   # Rayleigh
+        planck = np.tile(1.0 + 4.0 * (np.log10(tcum) + 4.0) / 7.0, (len(omegas), 1))
+        for use_map in (False, True):
+            f_up, f_dn = solve_batch(bc, dtau, ssa, pmom, planck, use_map=use_map)
+            f_up = np.asarray(f_up)
+            assert np.all(np.isfinite(f_up))
+            assert abs(f_up[1] - f_up[0]) <= 2e-4 * f_up[0], (use_map, f_up)
+            assert abs(f_up[2] - f_up[0]) <= 5e-3 * f_up[0], (use_map, f_up)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
