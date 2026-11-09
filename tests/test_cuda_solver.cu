@@ -1802,10 +1802,10 @@ static void test_raw_input_entry_point() {
   }
 
   // --- Test with cloud optical depth ---
-  std::vector<float> cloud_tau(nlay * nwav, 0.0f);
+  std::vector<float> particle_tau(nlay * nwav, 0.0f);
   for (int l = 0; l < nlay; ++l)
     for (int w = 0; w < nwav; ++w)
-      cloud_tau[l * nwav + w] = 0.01f * (l + 1);  // increasing with layer
+      particle_tau[l * nwav + w] = 0.01f * (l + 1);  // increasing with layer
 
   // Reference: add cloud tau to delta_tau (with BOA→TOA reversal)
   std::vector<float> ref_delta_tau_cloud(nwav * nlay);
@@ -1813,7 +1813,7 @@ static void test_raw_input_entry_point() {
   for (int w = 0; w < nwav; ++w) {
     for (int l = 0; l < nlay; ++l) {
       int bear_layer = nlay - 1 - l;
-      float cloud_contribution = cloud_tau[bear_layer * nwav + w];
+      float cloud_contribution = particle_tau[bear_layer * nwav + w];
       float orig_scat_depth = ref_ssa[w * nlay + l] * ref_delta_tau[w * nlay + l];
       ref_delta_tau_cloud[w * nlay + l] = ref_delta_tau[w * nlay + l] + cloud_contribution;
       float new_tau = ref_delta_tau_cloud[w * nlay + l];
@@ -1841,9 +1841,9 @@ static void test_raw_input_entry_point() {
   // Upload cloud tau and run raw solver
   float* d_cloud_tau = nullptr;
   cudaMalloc(&d_cloud_tau, nlay * nwav * sizeof(float));
-  cudaMemcpy(d_cloud_tau, cloud_tau.data(), nlay * nwav * sizeof(float), cudaMemcpyHostToDevice);
+  cudaMemcpy(d_cloud_tau, particle_tau.data(), nlay * nwav * sizeof(float), cudaMemcpyHostToDevice);
 
-  raw.cloud_optical_depth = d_cloud_tau;
+  raw.particle_optical_depth = d_cloud_tau;
   adrt::cuda::solveBatchFromCoefficients(raw_bcfg, raw);
   cudaDeviceSynchronize();
 
@@ -1948,6 +1948,231 @@ void test_weak_scattering() {
 }
 
 
+// ============================================================================
+//  Test: Raw-input entry point with a scattering particle component (HG) mixed into Rayleigh gas
+// ============================================================================
+//
+// The raw path receives gas Rayleigh moments (shared) plus particle optical depth,
+// single scattering albedo and HG asymmetry parameter per layer and wavenumber.
+// The reference run uses solveBatch with per-wavenumber moments that are mixed
+// on the host, weighted by the gas and cloud scattering optical depths, and the
+// corresponding combined single scattering albedo. Delta-M is enabled in both.
+
+static void test_raw_particle_scattering() {
+  std::cout << "=== Raw-input entry point with particle scattering ===\n";
+
+  constexpr int nwav = 4;
+  constexpr int nlay = 5;
+  constexpr int nlev = nlay + 1;
+
+  double wavenumbers[nwav] = {500.0, 1000.0, 1500.0, 2000.0};
+  float altitude[nlev] = {0.0f, 1e5f, 3e5f, 6e5f, 1e6f, 2e6f};
+  float temperature[nlev] = {1500.0f, 1300.0f, 1100.0f, 900.0f, 700.0f, 500.0f};
+
+  std::vector<float> abs_coeff(nlev * nwav);
+  std::vector<float> scat_coeff(nlev * nwav);
+  for (int lev = 0; lev < nlev; ++lev)
+    for (int w = 0; w < nwav; ++w) {
+      abs_coeff[lev * nwav + w] = 1e-6f * (1.0f + 0.5f * lev) * (1.0f + 0.3f * w);
+      scat_coeff[lev * nwav + w] = 0.3f * abs_coeff[lev * nwav + w];
+    }
+
+  // Cloud in BeAR layers 1..3 (BOA = 0), [layer * nwav + w]
+  std::vector<float> particle_tau(nlay * nwav, 0.0f);
+  std::vector<float> particle_ssa(nlay * nwav, 0.0f);
+  std::vector<float> particle_g(nlay * nwav, 0.0f);
+  for (int l = 1; l <= 3; ++l)
+    for (int w = 0; w < nwav; ++w) {
+      particle_tau[l * nwav + w] = 0.8f * (1.0f + 0.2f * w);
+      particle_ssa[l * nwav + w] = 0.6f + 0.1f * (l - 1);
+      particle_g[l * nwav + w]   = 0.5f + 0.1f * w;
+    }
+
+  for (int N : {2, 4, 8}) {
+    const int nmom = 2 * N + 1;   // delta-M needs the 2N-th moment
+
+    // Gas: Rayleigh moments, shared across wavenumbers, [l * nmom + m]
+    std::vector<float> gas_pmom(nlay * nmom, 0.0f);
+    for (int l = 0; l < nlay; ++l) {
+      gas_pmom[l * nmom + 0] = 1.0f;
+      if (nmom > 2) gas_pmom[l * nmom + 2] = 0.1f;
+    }
+
+    // Reference: combined layer properties and per-wavenumber mixed moments
+    std::vector<float> ref_delta_tau(nwav * nlay);
+    std::vector<float> ref_ssa(nwav * nlay);
+    std::vector<float> ref_pmom(nwav * nlay * nmom);
+    std::vector<float> ref_planck(nwav * nlev);
+    std::vector<float> ref_surface_emission(nwav), ref_top_emission(nwav);
+
+    for (int w = 0; w < nwav; ++w) {
+      for (int l = 0; l < nlay; ++l) {
+        int bear_layer = nlay - 1 - l;
+        float dz = altitude[bear_layer + 1] - altitude[bear_layer];
+        float abs_bot  = abs_coeff[bear_layer       * nwav + w];
+        float abs_top  = abs_coeff[(bear_layer + 1) * nwav + w];
+        float scat_bot = scat_coeff[bear_layer       * nwav + w];
+        float scat_top = scat_coeff[(bear_layer + 1) * nwav + w];
+        float tau = dz * (abs_top + abs_bot + scat_top + scat_bot) * 0.5f;
+        float gas_scat = dz * (scat_top + scat_bot) * 0.5f;
+        float ct = particle_tau[bear_layer * nwav + w];
+        float particle_scat = ct * particle_ssa[bear_layer * nwav + w];
+        tau += ct;
+        float scat_total = gas_scat + particle_scat;
+        float wc = (scat_total > 0.0f) ? particle_scat / scat_total : 0.0f;
+        float g = particle_g[bear_layer * nwav + w];
+
+        ref_delta_tau[w * nlay + l] = tau;
+        ref_ssa[w * nlay + l] = (tau > 0.0f) ? scat_total / tau : 0.0f;
+
+        float gk = 1.0f;
+        for (int m = 0; m < nmom; ++m) {
+          ref_pmom[(w * nlay + l) * nmom + m] = (1.0f - wc) * gas_pmom[l * nmom + m] + wc * gk;
+          gk *= g;
+        }
+      }
+      float wn = static_cast<float>(wavenumbers[w]);
+      for (int lev = 0; lev < nlev; ++lev)
+        ref_planck[w * nlev + lev] = planck_single_host(temperature[nlev - 1 - lev], wn);
+      ref_surface_emission[w] = planck_single_host(temperature[0], wn);
+      ref_top_emission[w] = 0.0f;   // top_temperature = 0 below: cold space
+    }
+
+    // Device arrays
+    float *d_abs, *d_scat, *d_alt, *d_temp, *d_gas_pmom, *d_ctau, *d_cssa, *d_cg;
+    float *d_flux_up, *d_flux_down;
+    float *d_ref_dtau, *d_ref_ssa, *d_ref_pmom, *d_ref_planck, *d_ref_surf_em, *d_ref_top_em;
+    double* d_wn;
+    cudaMalloc(&d_abs,  nlev * nwav * sizeof(float));
+    cudaMalloc(&d_scat, nlev * nwav * sizeof(float));
+    cudaMalloc(&d_alt,  nlev * sizeof(float));
+    cudaMalloc(&d_temp, nlev * sizeof(float));
+    cudaMalloc(&d_wn,   nwav * sizeof(double));
+    cudaMalloc(&d_gas_pmom, nlay * nmom * sizeof(float));
+    cudaMalloc(&d_ctau, nlay * nwav * sizeof(float));
+    cudaMalloc(&d_cssa, nlay * nwav * sizeof(float));
+    cudaMalloc(&d_cg,   nlay * nwav * sizeof(float));
+    cudaMalloc(&d_flux_up,   nwav * sizeof(float));
+    cudaMalloc(&d_flux_down, nwav * sizeof(float));
+    cudaMalloc(&d_ref_dtau,   nwav * nlay * sizeof(float));
+    cudaMalloc(&d_ref_ssa,    nwav * nlay * sizeof(float));
+    cudaMalloc(&d_ref_pmom,   nwav * nlay * nmom * sizeof(float));
+    cudaMalloc(&d_ref_planck, nwav * nlev * sizeof(float));
+    cudaMalloc(&d_ref_surf_em, nwav * sizeof(float));
+    cudaMalloc(&d_ref_top_em,  nwav * sizeof(float));
+
+    cudaMemcpy(d_abs,  abs_coeff.data(),  nlev * nwav * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_scat, scat_coeff.data(), nlev * nwav * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_alt,  altitude,    nlev * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_temp, temperature, nlev * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_wn,   wavenumbers, nwav * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_gas_pmom, gas_pmom.data(), nlay * nmom * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ctau, particle_tau.data(), nlay * nwav * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_cssa, particle_ssa.data(), nlay * nwav * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_cg,   particle_g.data(),   nlay * nwav * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ref_dtau,   ref_delta_tau.data(), nwav * nlay * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ref_ssa,    ref_ssa.data(),       nwav * nlay * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ref_pmom,   ref_pmom.data(),      nwav * nlay * nmom * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ref_planck, ref_planck.data(),    nwav * nlev * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ref_surf_em, ref_surface_emission.data(), nwav * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_ref_top_em,  ref_top_emission.data(),     nwav * sizeof(float), cudaMemcpyHostToDevice);
+
+    // Reference: pre-computed layer data with per-wavenumber moments
+    adrt::cuda::BatchConfig bcfg;
+    bcfg.num_wavenumbers = nwav;
+    bcfg.num_layers = nlay;
+    bcfg.num_quadrature = N;
+    bcfg.num_moments_max = nmom;
+    bcfg.use_delta_m = true;
+    bcfg.use_thermal_emission = false;
+    bcfg.surface_albedo = 0.0;
+
+    adrt::cuda::DeviceData ref_dd;
+    ref_dd.delta_tau = d_ref_dtau;
+    ref_dd.single_scat_albedo = d_ref_ssa;
+    ref_dd.phase_moments = d_ref_pmom;
+    ref_dd.phase_moments_shared = false;
+    ref_dd.planck_levels = d_ref_planck;
+    ref_dd.surface_emission = d_ref_surf_em;
+    ref_dd.top_emission = d_ref_top_em;
+    ref_dd.flux_up = d_flux_up;
+    ref_dd.flux_down = d_flux_down;
+
+    adrt::cuda::solveBatch(bcfg, ref_dd);
+    cudaDeviceSynchronize();
+
+    std::vector<float> ref_flux_up(nwav);
+    cudaMemcpy(ref_flux_up.data(), d_flux_up, nwav * sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Raw path with cloud scattering
+    adrt::cuda::RawDeviceData raw;
+    raw.absorption_coeff = d_abs;
+    raw.scattering_coeff = d_scat;
+    raw.altitude = d_alt;
+    raw.temperature = d_temp;
+    raw.wavenumber = d_wn;
+    raw.phase_moments = d_gas_pmom;
+    raw.phase_moments_shared = true;
+    raw.particle_optical_depth = d_ctau;
+    raw.particle_single_scattering = d_cssa;
+    raw.particle_asym_param = d_cg;
+    raw.flux_up = d_flux_up;
+    raw.flux_down = nullptr;   // optional output
+
+    adrt::cuda::BatchConfig raw_bcfg;
+    raw_bcfg.num_wavenumbers = nwav;
+    raw_bcfg.num_layers = nlay;
+    raw_bcfg.num_quadrature = N;
+    raw_bcfg.num_moments_max = nmom;
+    raw_bcfg.use_delta_m = true;
+    raw_bcfg.use_thermal_emission = true;
+    raw_bcfg.top_temperature = 0.0;   // cold space, matches ref_top_emission = 0
+    raw_bcfg.surface_albedo = 0.0;
+
+    adrt::cuda::solveBatchFromCoefficients(raw_bcfg, raw);
+    cudaDeviceSynchronize();
+
+    std::vector<float> test_flux_up(nwav);
+    cudaMemcpy(test_flux_up.data(), d_flux_up, nwav * sizeof(float), cudaMemcpyDeviceToHost);
+
+    for (int w = 0; w < nwav; ++w) {
+      char name[128];
+      snprintf(name, sizeof(name), "raw_particle_scat_flux_up[N=%d, wn=%.0f]", N, wavenumbers[w]);
+      CHECK_NEAR(name, test_flux_up[w], ref_flux_up[w], 5e-4f * std::abs(ref_flux_up[w]) + 1e-12f);
+    }
+
+    // Particles with zero albedo must reproduce the pure-absorber raw path exactly
+    std::vector<float> zeros(nlay * nwav, 0.0f);
+    cudaMemcpy(d_cssa, zeros.data(), nlay * nwav * sizeof(float), cudaMemcpyHostToDevice);
+    adrt::cuda::solveBatchFromCoefficients(raw_bcfg, raw);
+    cudaDeviceSynchronize();
+    std::vector<float> flux_ssa0(nwav);
+    cudaMemcpy(flux_ssa0.data(), d_flux_up, nwav * sizeof(float), cudaMemcpyDeviceToHost);
+
+    raw.particle_single_scattering = nullptr;
+    raw.particle_asym_param = nullptr;
+    adrt::cuda::solveBatchFromCoefficients(raw_bcfg, raw);
+    cudaDeviceSynchronize();
+    std::vector<float> flux_absorber(nwav);
+    cudaMemcpy(flux_absorber.data(), d_flux_up, nwav * sizeof(float), cudaMemcpyDeviceToHost);
+
+    for (int w = 0; w < nwav; ++w) {
+      char name[128];
+      snprintf(name, sizeof(name), "raw_particle_ssa0_equals_absorber[N=%d, wn=%.0f]", N, wavenumbers[w]);
+      CHECK_NEAR(name, flux_ssa0[w], flux_absorber[w], 1e-5f * std::abs(flux_absorber[w]) + 1e-12f);
+    }
+
+    cudaFree(d_abs); cudaFree(d_scat); cudaFree(d_alt); cudaFree(d_temp); cudaFree(d_wn);
+    cudaFree(d_gas_pmom); cudaFree(d_ctau); cudaFree(d_cssa); cudaFree(d_cg);
+    cudaFree(d_flux_up); cudaFree(d_flux_down);
+    cudaFree(d_ref_dtau); cudaFree(d_ref_ssa); cudaFree(d_ref_pmom); cudaFree(d_ref_planck);
+    cudaFree(d_ref_surf_em); cudaFree(d_ref_top_em);
+  }
+
+  std::cout << "done\n";
+}
+
+
 int main() {
   std::cout << "CUDA Adding-Doubling Solver Validation Tests\n";
   std::cout << "=============================================\n\n";
@@ -2042,6 +2267,7 @@ int main() {
 
   // Raw-input entry point
   test_raw_input_entry_point();
+  test_raw_particle_scattering();
 
   int total = g_passed + g_failed;
   std::cout << "\n" << g_passed << "/" << total << " checks passed";

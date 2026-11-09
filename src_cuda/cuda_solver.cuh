@@ -117,14 +117,26 @@ struct RawDeviceData {
   const float* temperature;          ///< [nlev] temperature (K), BOA = index 0
   const double* wavenumber;          ///< [nwav] wavenumber (cm⁻¹)
 
-  // --- Phase function (same convention as DeviceData) ---
+  // --- Phase function of the gas (same convention as DeviceData) ---
 
   const float* phase_moments;        ///< [nlay * nmom] or [nwav * nlay * nmom]
   bool phase_moments_shared = false; ///< true if moments are shared across wavenumbers
 
-  // --- Optional cloud contribution (level-major, BOA = index 0) ---
-
-  const float* cloud_optical_depth = nullptr;  ///< [nlay * nwav] or nullptr
+  // --- Optional second scattering component (layer-based, BOA = index 0) ---
+  //
+  // The level-based coefficients above describe the gas. A second component,
+  // e.g. cloud or haze particles, can be added per layer through its optical
+  // depth, single scattering albedo and Henyey-Greenstein asymmetry parameter.
+  // The solver mixes both components exactly: the layer optical depth is the sum,
+  // the albedo is the scattering-weighted mean, and the Legendre moments are the
+  // scattering-weighted mean of the gas moments (phase_moments) and g^l. Any
+  // null pointer leaves that property at zero (no particles, pure absorbers,
+  // isotropic scattering). The mixing is fully supported for N <= 16; the N > 16
+  // workspace path includes the particle scattering in the albedo but uses the
+  // gas phase moments for the whole layer.
+  const float* particle_optical_depth = nullptr;      ///< [nlay * nwav] or nullptr
+  const float* particle_single_scattering = nullptr;  ///< [nlay * nwav] or nullptr
+  const float* particle_asym_param = nullptr;         ///< [nlay * nwav] or nullptr
 
   // --- Outputs (caller-owned device memory) ---
 

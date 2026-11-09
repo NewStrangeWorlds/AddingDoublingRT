@@ -153,7 +153,9 @@ __global__ void solveKernel(
     const float* __restrict__ raw_altitude,
     const float* __restrict__ raw_temperature,
     const double* __restrict__ raw_wavenumber,
-    const float* __restrict__ raw_cloud_tau)
+    const float* __restrict__ raw_particle_tau,
+    const float* __restrict__ raw_particle_ssa,
+    const float* __restrict__ raw_particle_g)
 {
   constexpr float PI = 3.14159265f;
 
@@ -191,8 +193,10 @@ __global__ void solveKernel(
   };
 
   // Helper lambda to compute tau and ssa for ADRT layer l (TOA=0) from raw inputs.
-  // Returns via output references.
-  auto loadTauSsa = [&](int l, float& out_tau, float& out_ssa) {
+  // out_wc is the particle fraction of the layer's scattering optical depth (0 without
+  // particle scattering); it weights the particle phase function in loadMoments.
+  auto loadTauSsa = [&](int l, float& out_tau, float& out_ssa, float& out_wc) {
+    out_wc = 0.0f;
     if (has_raw) {
       // Map ADRT layer l (TOA=0) to BeAR layer (BOA=0)
       int bear_layer = nlay - 1 - l;
@@ -208,15 +212,47 @@ __global__ void solveKernel(
 
       out_tau = dz * (ext_top + ext_bot) * 0.5f;
       float scat_depth = dz * (scat_top + scat_bot) * 0.5f;
+      float particle_scat_depth = 0.0f;
 
-      if (raw_cloud_tau != nullptr)
-        out_tau += raw_cloud_tau[bear_layer * cfg.nwav + w];
+      if (raw_particle_tau != nullptr) {
+        float particle_tau = raw_particle_tau[bear_layer * cfg.nwav + w];
+        out_tau += particle_tau;
+        if (raw_particle_ssa != nullptr)
+          particle_scat_depth = particle_tau * raw_particle_ssa[bear_layer * cfg.nwav + w];
+      }
+
+      float scat_total = scat_depth + particle_scat_depth;
 
       if (out_tau < 0.0f) out_tau = 0.0f;
-      out_ssa = (out_tau > 0.0f) ? scat_depth / out_tau : 0.0f;
+      out_ssa = (out_tau > 0.0f) ? scat_total / out_tau : 0.0f;
+      if (out_ssa > 1.0f) out_ssa = 1.0f;
+      if (scat_total > 0.0f) out_wc = particle_scat_depth / scat_total;
     } else {
       out_tau = delta_tau[w * nlay + l];
       out_ssa = single_scat_albedo[w * nlay + l];
+    }
+  };
+
+  // Helper lambda to load the Legendre moments of ADRT layer l into buf.
+  // With a scattering particle component the gas moments (shared or per wavenumber)
+  // are mixed with its Henyey-Greenstein phase function, weighted by the scattering depths.
+  auto loadMoments = [&](int l, float wc, float* buf) {
+    int nmom = cfg.nmom_max;
+    const float* gas = cfg.phase_moments_shared
+                         ? phase_moments + l * nmom
+                         : phase_moments + (w * nlay + l) * nmom;
+
+    if (has_raw && raw_particle_ssa != nullptr && wc > 0.0f) {
+      int bear_layer = nlay - 1 - l;
+      float g = (raw_particle_g != nullptr) ? raw_particle_g[bear_layer * cfg.nwav + w] : 0.0f;
+      float gk = 1.0f;
+      for (int m = 0; m < nmom; ++m) {
+        buf[m] = (1.0f - wc) * gas[m] + wc * gk;
+        gk *= g;
+      }
+    } else {
+      for (int m = 0; m < nmom; ++m)
+        buf[m] = gas[m];
     }
   };
 
@@ -265,14 +301,19 @@ __global__ void solveKernel(
   // the CPU (tau_used); mixing unscaled cumulative with scaled layer depths
   // over-attenuated the beam by exp(-omega f tau / mu0) (3% flux error in the
   // delta-M tests).
-  auto scaledTau = [&](int l, float t, float s) -> float {
+  auto scaledTau = [&](int l, float t, float s, float wc) -> float {
     if (!cfg.use_delta_m || s <= 0.0f || t <= 0.0f) return t;
     float f;
     if (has_precomp) {
       f = precomp_f_trunc[l];
     } else {
       int nmom = cfg.nmom_max;
-      f = (nmom > two_M) ? phase_moments[w * nlay * nmom + l * nmom + two_M] : 0.0f;
+      if (nmom > two_M) {
+        loadMoments(l, wc, chi_buf);
+        f = chi_buf[two_M];
+      } else {
+        f = 0.0f;
+      }
       if (!(f > 1e-12f && f < 1.0f - 1e-12f)) f = 0.0f;
     }
     return (1.0f - s * f) * t;
@@ -281,9 +322,9 @@ __global__ void solveKernel(
   // Compute total (delta-M scaled) optical depth (surface solar beam, flux_direct)
   float tau_total = 0.0f;
   for (int l = 0; l < nlay; ++l) {
-    float t, s;
-    loadTauSsa(l, t, s);
-    tau_total += scaledTau(l, t, s);
+    float t, s, wc;
+    loadTauSsa(l, t, s, wc);
+    tau_total += scaledTau(l, t, s, wc);
   }
 
   // Surface layer (if applicable)
@@ -330,13 +371,13 @@ __global__ void solveKernel(
   float B_prev = loadB(nlay);
 
   for (int l = nlay - 1; l >= 0; --l) {
-    float tau_layer, omega_layer;
-    loadTauSsa(l, tau_layer, omega_layer);
+    float tau_layer, omega_layer, wc_layer;
+    loadTauSsa(l, tau_layer, omega_layer, wc_layer);
     float B_layer_top = loadB(l);
     float B_layer_bot = B_prev;
     B_prev = B_layer_top;
 
-    tau_above -= scaledTau(l, tau_layer, omega_layer);   // scaled cumulative depth above layer l
+    tau_above -= scaledTau(l, tau_layer, omega_layer, wc_layer);   // scaled cumulative depth above layer l
 
     // Skip effectively transparent layers (avoid expensive doubling + adding)
     if (tau_layer < 1e-8f)
@@ -387,8 +428,7 @@ __global__ void solveKernel(
     }
     else {
       int nmom = cfg.nmom_max;
-      for (int m = 0; m < nmom; ++m)
-        chi_buf[m] = phase_moments[w * nlay * nmom + l * nmom + m];
+      loadMoments(l, wc_layer, chi_buf);
 
       if (cfg.use_delta_m && omega_layer > 0.0f && tau_layer > 0.0f) {
         float f_trunc = (nmom > two_M) ? chi_buf[two_M] : 0.0f;
@@ -469,9 +509,9 @@ __global__ void solveKernel(
   if (cfg.use_diffusion_lower_bc) {
     float B_bottom = loadB(nlay);
     float B_second_last = loadB(nlay - 1);
-    float dtau_last_t, dtau_last_s;
-    loadTauSsa(nlay - 1, dtau_last_t, dtau_last_s);
-    dtau_last_t = scaledTau(nlay - 1, dtau_last_t, dtau_last_s);   // delta-M scaled, as on the CPU (tau_used)
+    float dtau_last_t, dtau_last_s, dtau_last_wc;
+    loadTauSsa(nlay - 1, dtau_last_t, dtau_last_s, dtau_last_wc);
+    dtau_last_t = scaledTau(nlay - 1, dtau_last_t, dtau_last_s, dtau_last_wc);   // delta-M scaled, as on the CPU (tau_used)
     float dB_dtau = (dtau_last_t > 0.0f) ? (B_bottom - B_second_last) / dtau_last_t : 0.0f;
     #pragma unroll
     for (int i = 0; i < N; ++i)
@@ -1008,7 +1048,7 @@ void solveBatch(
         data.flux_up, data.flux_down, data.flux_direct, \
         d_precomp_Ppp, d_precomp_Ppm, d_precomp_f_trunc, \
         d_precomp_solar_pp, d_precomp_solar_pm, \
-        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr); }
+        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr); }
 
   #define LAUNCH_WARP_SOLVE_KERNEL(NQ) \
     { int groups_per_block = threads_per_block / NQ; \
@@ -1175,7 +1215,8 @@ __global__ void preprocessRawKernel(
     const float* __restrict__ altitude,
     const float* __restrict__ temperature,
     const double* __restrict__ wavenumber,
-    const float* __restrict__ cloud_tau,
+    const float* __restrict__ particle_tau,
+    const float* __restrict__ particle_ssa,
     float* __restrict__ out_delta_tau,
     float* __restrict__ out_ssa,
     float* __restrict__ out_planck,
@@ -1204,11 +1245,16 @@ __global__ void preprocessRawKernel(
     float tau = dz * (ext_top + ext_bot) * 0.5f;
     float scat_depth = dz * (scat_top + scat_bot) * 0.5f;
 
-    if (cloud_tau != nullptr)
-      tau += cloud_tau[bear_layer * nwav + w];
+    if (particle_tau != nullptr) {
+      float ct = particle_tau[bear_layer * nwav + w];
+      tau += ct;
+      if (particle_ssa != nullptr)
+        scat_depth += ct * particle_ssa[bear_layer * nwav + w];
+    }
 
     if (tau < 0.0f) tau = 0.0f;
     float ssa = (tau > 0.0f) ? scat_depth / tau : 0.0f;
+    if (ssa > 1.0f) ssa = 1.0f;
 
     out_delta_tau[w * nlay + l] = tau;
     out_ssa      [w * nlay + l] = ssa;
@@ -1240,8 +1286,10 @@ void solveBatchFromCoefficients(
   if (L > MAX_NMOM) L = MAX_NMOM;
   uploadQuadratureData(N, L);
 
-  if (N > 8) {
-    fprintf(stderr, "solveBatchFromCoefficients: N > 8 requires workspace overload.\n");
+  // N = 16 uses the per-thread register kernel as well (slower than N <= 8 because of
+  // register spilling, but it supports per-wavenumber phase moments and inline particle mixing)
+  if (N > 16) {
+    fprintf(stderr, "solveBatchFromCoefficients: N > 16 requires workspace overload.\n");
     return;
   }
 
@@ -1269,12 +1317,16 @@ void solveBatchFromCoefficients(
   int nlay = config.num_layers;
   bool has_solar = (config.solar_flux > 0.0 && config.solar_mu > 0.0);
 
-  // Precompute phase matrices (shared moments path)
+  // Precompute phase matrices (shared moments path). A scattering particle component
+  // makes the moments wavenumber dependent, so they are built in the kernel then.
   float *d_precomp_Ppp = nullptr, *d_precomp_Ppm = nullptr;
   float *d_precomp_f_trunc = nullptr;
   float *d_precomp_solar_pp = nullptr, *d_precomp_solar_pm = nullptr;
 
-  if (data.phase_moments_shared) {
+  const bool precompute_phase =
+      data.phase_moments_shared && data.particle_single_scattering == nullptr;
+
+  if (precompute_phase) {
     cudaMalloc(&d_precomp_Ppp, nlay * N * N * sizeof(float));
     cudaMalloc(&d_precomp_Ppm, nlay * N * N * sizeof(float));
     cudaMalloc(&d_precomp_f_trunc, nlay * sizeof(float));
@@ -1310,6 +1362,13 @@ void solveBatchFromCoefficients(
             d_precomp_Ppp, d_precomp_Ppm, d_precomp_f_trunc,
             d_precomp_solar_pp, d_precomp_solar_pm);
         break;
+      case 16:
+        precomputePhaseKernel<16><<<precomp_blocks, precomp_threads, 0, stream>>>(
+            nlay, config.num_moments_max, config.use_delta_m,
+            solar_mu_f, has_solar, data.phase_moments,
+            d_precomp_Ppp, d_precomp_Ppm, d_precomp_f_trunc,
+            d_precomp_solar_pp, d_precomp_solar_pm);
+        break;
     }
   }
 
@@ -1325,12 +1384,14 @@ void solveBatchFromCoefficients(
         d_precomp_solar_pp, d_precomp_solar_pm, \
         data.absorption_coeff, data.scattering_coeff, \
         data.altitude, data.temperature, data.wavenumber, \
-        data.cloud_optical_depth); }
+        data.particle_optical_depth, data.particle_single_scattering, \
+        data.particle_asym_param); }
 
   switch (N) {
     case 2: LAUNCH_RAW_KERNEL(2); break;
     case 4: LAUNCH_RAW_KERNEL(4); break;
     case 8: LAUNCH_RAW_KERNEL(8); break;
+    case 16: LAUNCH_RAW_KERNEL(16); break;
   }
 
   #undef LAUNCH_RAW_KERNEL
@@ -1364,6 +1425,18 @@ void solveBatchFromCoefficients(
   // Allocate workspace if needed
   workspace.allocate(nwav, nlay);
 
+  // The batched path only supports moments shared across wavenumbers, so the
+  // particle phase function cannot be mixed in per layer here.
+  if (data.particle_asym_param != nullptr) {
+    static bool warned = false;
+    if (!warned) {
+      fprintf(stderr, "solveBatchFromCoefficients (N > 16): particle scattering is included "
+                      "in the single scattering albedo, but the particle phase function is "
+                      "ignored (gas phase moments are used for the whole layer).\n");
+      warned = true;
+    }
+  }
+
   // Preprocess: convert raw coefficients to delta_tau, ssa, planck
   int threads = 128;
   int blocks = (nwav + threads - 1) / threads;
@@ -1371,7 +1444,7 @@ void solveBatchFromCoefficients(
       nwav, nlay,
       data.absorption_coeff, data.scattering_coeff,
       data.altitude, data.temperature, data.wavenumber,
-      data.cloud_optical_depth,
+      data.particle_optical_depth, data.particle_single_scattering,
       workspace.delta_tau, workspace.single_scat_albedo,
       workspace.planck_levels,
       workspace.surface_emission, workspace.top_emission);
