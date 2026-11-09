@@ -1008,7 +1008,8 @@ void solveBatchedCublas(
       ws.I_top_down, ws.I_bot_up,
       ws.d_mu_rt, ws.d_wt_rt,
       data.flux_up, data.flux_down, data.flux_direct,
-      has_solar, solar_flux, solar_mu, ws.tau_total);
+      has_solar, solar_flux, solar_mu, ws.tau_total,
+      static_cast<float>(config.spectrum_scaling));
 
   // Synchronize and cleanup
   cudaStreamSynchronize(stream);

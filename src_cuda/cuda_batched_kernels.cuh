@@ -831,10 +831,11 @@ __global__ void batchedFluxReductionKernel(
     const float* __restrict__ mu,          // [N]
     const float* __restrict__ wt,          // [N]
     float* __restrict__ flux_up,           // [nwav]
-    float* __restrict__ flux_down,         // [nwav]
+    float* __restrict__ flux_down,         // [nwav] or nullptr
     float* __restrict__ flux_direct,       // [nwav] or nullptr
     bool has_solar, float solar_flux, float solar_mu,
-    const float* __restrict__ tau_total)   // [nwav]
+    const float* __restrict__ tau_total,   // [nwav]
+    float spectrum_scaling)                // constant factor applied to flux_up only
 {
   constexpr float PI = 3.14159265f;
   int w = blockIdx.x * blockDim.x + threadIdx.x;
@@ -858,8 +859,10 @@ __global__ void batchedFluxReductionKernel(
     F_down += 2.0f * PI * wt[i] * mu[i] * I_top_down[w * N + i];
   }
 
-  flux_up[w] = F_up;
-  flux_down[w] = F_down;
+  flux_up[w] = F_up * spectrum_scaling;
+
+  if (flux_down != nullptr)
+    flux_down[w] = F_down;
 
   if (flux_direct != nullptr) {
     if (has_solar)
