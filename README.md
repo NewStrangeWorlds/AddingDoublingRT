@@ -88,7 +88,7 @@ cd build && ctest --output-on-failure
 ### JAX
 
 ```bash
-# Run the JAX test suite (72 tests)
+# Run the JAX test suite (74 tests)
 pytest tests/test_jax_solver.py -v
 
 # Run the 3-way performance benchmark (C++ CPU vs CUDA vs JAX)

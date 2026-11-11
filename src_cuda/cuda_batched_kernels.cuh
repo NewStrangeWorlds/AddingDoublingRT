@@ -683,10 +683,14 @@ __global__ void batchedPureAbsorptionKernel(
     float B_bot = B_levels[w * nlev + layer_idx + 1];
     float B_bar = (B_bot + B_top) * 0.5f;
     float B_d_val = (t > 0.0f) ? (B_bot - B_top) / t : 0.0f;
-    float tex = -t / mu[i];
-    float trans = (tex > -87.0f) ? expf(tex) : 0.0f;
-    float one_minus_t = 1.0f - trans;
-    float slope_term = mu[i] * one_minus_t - 0.5f * t * (1.0f + trans);
+    // see pure_absorption_source_terms in cuda_doubling.cuh: expm1 and a series
+    // for the slope term, the direct form loses all digits for t/mu < ~1e-4
+    float x = t / mu[i];
+    float trans = (x < 87.0f) ? expf(-x) : 0.0f;
+    float one_minus_t = -expm1f(-x);
+    float slope_term = (x < 3e-2f)
+        ? mu[i] * x * x * x * (-1.0f / 12.0f + x * (1.0f / 24.0f - x / 80.0f))
+        : mu[i] * one_minus_t - 0.5f * t * (1.0f + trans);
     s_up[idx]   = B_bar * one_minus_t + B_d_val * slope_term;
     s_down[idx] = B_bar * one_minus_t - B_d_val * slope_term;
     s_up_solar[idx]   = 0.0f;

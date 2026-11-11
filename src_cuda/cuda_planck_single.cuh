@@ -25,8 +25,11 @@ float planck_single(float temperature, float wavenumber)
   //
   // c1 = 2 h c² × 1e-3 = 1.19105e-08  (unit conversion to W m⁻² cm)
   // c2 = h c / k         = 1.43879
-  constexpr float c1 = 1.19105e-08f;
-  constexpr float c2 = 1.43879f;
+  // Same values as the CPU adrt::planckFunction (planck.cpp) so that the raw
+  // path and a CPU reference agree: c1 = 1.1911e-8, c2 = 1.438786 (the former
+  // 1.19105e-8 / 1.43879 gave a systematic -1.6e-4 at c2 nu / T ~ 50).
+  constexpr float c1 = 1.1911e-08f;
+  constexpr float c2 = 1.438786f;
 
   if (temperature < 1e-5f) return 0.0f;
 

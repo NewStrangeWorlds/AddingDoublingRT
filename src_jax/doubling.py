@@ -191,11 +191,18 @@ def doubling(tau, omega, B_top, B_bottom, Ppp, Ppm, mu, weights,
 
     # Pure absorption
     if omega <= 0.0:
-        tex = -tau / mu
-        trans = jnp.where(tex > -200.0, jnp.exp(tex), 0.0)
+        # 1 - exp(-x) via expm1 and the slope term from its series for small
+        # x: the direct form loses all digits for x below ~1e-4 in float32
+        # (1 - e rounds to 0, slope -> -tau instead of O(tau^3)), turning thin
+        # absorbing layers with a Planck gradient into spurious emitters.
+        x = tau / mu
+        trans = jnp.where(x < 200.0, jnp.exp(-x), 0.0)
         T_diag = jnp.diag(trans)
-        one_minus_t = 1.0 - trans
-        slope_term = mu * one_minus_t - 0.5 * tau * (1.0 + trans)
+        one_minus_t = -jnp.expm1(-x)
+        x_small = 1e-3 if mu.dtype == jnp.float64 else 3e-2
+        slope_series = mu * x ** 3 * (-1.0 / 12.0 + x * (1.0 / 24.0 - x / 80.0))
+        slope_direct = mu * one_minus_t - 0.5 * tau * (1.0 + trans)
+        slope_term = jnp.where(x < x_small, slope_series, slope_direct)
         s_up = B_bar * one_minus_t + B_d * slope_term
         s_down = B_bar * one_minus_t - B_d * slope_term
 

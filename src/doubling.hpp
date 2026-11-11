@@ -60,6 +60,29 @@ inline int computeDoublingCount(
 }
 
 
+/// Thermal source terms of a purely absorbing layer along a single stream,
+/// x = tau/mu: the emitted fraction a = 1 - exp(-x) and the linear-source
+/// slope term s = mu (1 - e) - tau/2 (1 + e) = -mu x^3/12 + mu x^4/24 - ...
+/// Both are evaluated without cancellation: a via expm1 and s from its series
+/// for small x. The direct form of s loses all digits for x below ~1e-4 in
+/// float (1 - e rounds to zero, s becomes -tau instead of O(tau^3)), which turned
+/// every optically thin absorbing layer with a Planck gradient into a spurious
+/// emitter of -(B_bottom - B_top) per stream (14% flux errors in a BeAR
+/// hot-Jupiter column whose upper layers have tau ~ 1e-9 .. 1e-5).
+/// x_small: 1e-3 in double, 3e-2 in float (series error ~x^3 relative).
+inline void pureAbsorptionSourceTerms(
+  const double tau, const double mu, const double x_small,
+  double& trans, double& one_minus_t, double& slope)
+{
+  const double x = tau / mu;
+  trans = (x < 700.0) ? std::exp(-x) : 0.0;
+  one_minus_t = -std::expm1(-x);
+  slope = (x < x_small)
+    ? mu * x * x * x * (-1.0 / 12.0 + x * (1.0 / 24.0 - x / 80.0))
+    : mu * one_minus_t - 0.5 * tau * (1.0 + trans);
+}
+
+
 /// phi(u) = expm1(u) / u, with phi(0) = 1.
 inline double doublingPhi(double u)
 {
@@ -302,12 +325,10 @@ LayerMatrices<N> doubling(
 
     for (int i = 0; i < N; ++i) 
     {
-      double tex = -tau / mu[i];
-      double trans = (tex > -200.0) ? std::exp(tex) : 0.0;
+      double trans, one_minus_t, slope_term;
+      pureAbsorptionSourceTerms(tau, mu[i], 1e-3, trans, one_minus_t, slope_term);
       layer.T_ab(i, i) = trans;
       layer.T_ba(i, i) = trans;
-      double one_minus_t = 1.0 - trans;
-      double slope_term = mu[i] * one_minus_t - 0.5 * tau * (1.0 + trans);
       layer.s_up[i]   = B_bar * one_minus_t + B_d * slope_term;
       layer.s_down[i] = B_bar * one_minus_t - B_d * slope_term;
       // Source-derivative basis (tau > 0 here): a_i = one_minus_t, b_i = slope_term.

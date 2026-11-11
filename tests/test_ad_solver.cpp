@@ -992,6 +992,60 @@ TEST(ADSolver, ThermalPureAbsorption) {
   EXPECT_GT(r.flux_up[3], r.flux_up[0]);
 }
 
+// Optically thin purely absorbing layers with a strong Planck gradient (the
+// upper layers of a BeAR hot-Jupiter column: tau ~ 1e-9 .. 1e-5, omega = 0).
+// The thin-layer source terms must be evaluated without cancellation
+// (expm1 and the series of the slope term): the direct form made every such
+// layer emit -(B_bottom - B_top) per stream in float (14% flux errors).
+static adrt::ADConfig thinAbsorbingStackConfig(bool with_thin_layers, int N) {
+  const int n_thin = with_thin_layers ? 25 : 0;
+  const std::vector<double> tau_thick = {0.01, 0.1, 1.0, 10.0, 100.0};
+  const int nlay = n_thin + static_cast<int>(tau_thick.size());
+  adrt::ADConfig cfg(nlay, N);
+  cfg.allocate();
+  cfg.planck_levels.assign(nlay + 1, 0.0);
+  for (int l = 0; l < n_thin; ++l) {
+    cfg.delta_tau[l] = 1e-9 * std::pow(10.0, 4.0 * l / 24.0);   // 1e-9 .. 1e-5
+    cfg.planck_levels[l] = 0.01 + (2.0 - 0.01) * l / 25.0;      // strong gradient
+  }
+  for (size_t k = 0; k < tau_thick.size(); ++k) {
+    cfg.delta_tau[n_thin + k] = tau_thick[k];
+    cfg.planck_levels[n_thin + k] = 2.0 + 3.0 * k / tau_thick.size();
+  }
+  cfg.planck_levels[nlay] = 5.0;
+  for (int l = 0; l < nlay; ++l) cfg.single_scat_albedo[l] = 0.0;
+  cfg.setIsotropic();
+  cfg.surface_albedo = 0.0;
+  cfg.surface_emission = 5.0;
+  return cfg;
+}
+
+TEST(ADSolver, ThinPureAbsorptionLinearSource) {
+  // (a) a stack of thin layers (total tau 1.4e-5) is transparent: the TOA flux
+  //     equals that of the column without them to O(sum tau)
+  for (int N : {4, 8, 16}) {
+    auto full = adrt::solve(thinAbsorbingStackConfig(true, N));
+    auto base = adrt::solve(thinAbsorbingStackConfig(false, N));
+    EXPECT_NEAR(full.flux_up[0] / base.flux_up[0], 1.0, 1e-4);
+    EXPECT_GT(full.flux_up[0], 0.0);
+  }
+  // (b) a single thin layer with B_top = 0, B_bottom = 1 emits ~pi*tau/2*2:
+  //     F_up(TOA) scales linearly with tau in the thin limit
+  auto single = [](double tau) {
+    adrt::ADConfig cfg(1, 8);
+    cfg.allocate();
+    cfg.delta_tau[0] = tau;
+    cfg.single_scat_albedo[0] = 0.0;
+    cfg.setIsotropic();
+    cfg.planck_levels = {0.0, 1.0};
+    cfg.surface_albedo = 0.0;
+    cfg.surface_emission = 0.0;
+    return adrt::solve(cfg).flux_up[0];
+  };
+  EXPECT_NEAR(single(1e-8) / single(1e-5), 1e-3, 1e-6);
+  EXPECT_GT(single(1e-8), 0.0);
+}
+
 TEST(ADSolver, ThermalSurfaceTemperature) {
   // Surface (skin) temperature decoupled from the bottom level temperature.
   // Build a thermally emitting, purely absorbing atmosphere with a black surface.

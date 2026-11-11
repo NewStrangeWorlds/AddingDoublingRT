@@ -1498,6 +1498,42 @@ void test_linear_source_pure_absorption() {
 //  N=16 specific tests (batched cuBLAS path)
 // ============================================================================
 
+// Thin purely absorbing layers (tau 1e-9 .. 1e-5, omega = 0) with a strong
+// Planck gradient on top of an opaque stack: the upper layers of a BeAR
+// hot-Jupiter column. The float source terms must use expm1 and the series of
+// the slope term; the direct form gave -14% at 4.5 um in BeAR (every thin
+// layer emitted -(B_bottom - B_top) per stream).
+void test_thin_pure_absorption_gradient() {
+  std::cout << "  test_thin_pure_absorption_gradient ... ";
+  for (int N : {4, 8, 16}) {
+    const int n_thin = 25;
+    const std::vector<double> tau_thick = {0.01, 0.1, 1.0, 10.0, 100.0};
+    const int nlay = n_thin + static_cast<int>(tau_thick.size());
+    adrt::ADConfig cfg(nlay, N);
+    cfg.allocate();
+    cfg.planck_levels.assign(nlay + 1, 0.0);
+    for (int l = 0; l < n_thin; ++l) {
+      cfg.delta_tau[l] = 1e-9 * std::pow(10.0, 4.0 * l / 24.0);
+      cfg.planck_levels[l] = 0.01 + (2.0 - 0.01) * l / 25.0;
+    }
+    for (size_t k = 0; k < tau_thick.size(); ++k) {
+      cfg.delta_tau[n_thin + k] = tau_thick[k];
+      cfg.planck_levels[n_thin + k] = 2.0 + 3.0 * k / tau_thick.size();
+    }
+    cfg.planck_levels[nlay] = 5.0;
+    for (int l = 0; l < nlay; ++l) cfg.single_scat_albedo[l] = 0.0;
+    cfg.setIsotropic();
+    cfg.surface_albedo = 0.0;
+    cfg.surface_emission = 5.0;
+
+    auto cpu = cpuSolve(cfg);
+    auto cuda = cudaSolveSingle(cfg);
+    CHECK_NEAR(("flux_up_toa_N" + std::to_string(N)).c_str(), cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], 1e-4));
+  }
+  std::cout << "done\n";
+}
+
+
 void test_n16_specific() {
   std::cout << "  test_n16_specific ... ";
 
@@ -2247,6 +2283,7 @@ int main() {
 
   // Linear source (analytical)
   test_linear_source_pure_absorption();
+  test_thin_pure_absorption_gradient();
 
   // Energy conservation
   test_energy_conservation();

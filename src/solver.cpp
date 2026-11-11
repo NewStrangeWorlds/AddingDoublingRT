@@ -1105,14 +1105,11 @@ static DynLayerMatrices dynDoubling(
     
     for (int i = 0; i < n; ++i) 
     {
-      double tex = -tau / mu[i];
-      double trans = (tex > -200.0) ? std::exp(tex) : 0.0;
+      double trans, one_minus_t, slope_term;
+      pureAbsorptionSourceTerms(tau, mu[i], 1e-3, trans, one_minus_t, slope_term);
       
       layer.T_ab(i, i) = trans;
       layer.T_ba(i, i) = trans;
-      
-      double one_minus_t = 1.0 - trans;
-      double slope_term = mu[i] * one_minus_t - 0.5 * tau * (1.0 + trans);
 
       layer.s_up[i]   = B_bar * one_minus_t + B_d * slope_term;
       layer.s_down[i] = B_bar * one_minus_t - B_d * slope_term;

@@ -54,6 +54,22 @@ __device__ __forceinline__ int compute_doubling_count(float tau, float omega) {
   return max(1, max(nn, n_ext));
 }
 
+/// Thermal source terms of a purely absorbing layer along one stream (port of
+/// adrt::pureAbsorptionSourceTerms): trans = exp(-x), a = 1 - exp(-x) via
+/// expm1f, slope = mu (1 - e) - tau/2 (1 + e) from its series for x < 3e-2.
+/// The direct slope form loses all digits in float for x below ~1e-4 (1 - e
+/// rounds to 0, slope -> -tau instead of O(tau^3)) and made every thin absorbing
+/// layer with a Planck gradient emit a spurious -(B_bottom - B_top).
+__device__ __forceinline__ void pure_absorption_source_terms(
+    float tau, float mu, float& trans, float& one_minus_t, float& slope) {
+  float x = tau / mu;
+  trans = (x < 87.0f) ? expf(-x) : 0.0f;
+  one_minus_t = -expm1f(-x);
+  slope = (x < 3e-2f)
+      ? mu * x * x * x * (-1.0f / 12.0f + x * (1.0f / 24.0f - x / 80.0f))
+      : mu * one_minus_t - 0.5f * tau * (1.0f + trans);
+}
+
 /// phi(u) = expm1(u) / u, phi(0) = 1.
 __device__ __forceinline__ float doubling_phi(float u) {
   return (fabsf(u) < 1e-6f) ? 1.0f + 0.5f * u : expm1f(u) / u;
@@ -134,12 +150,10 @@ __device__ __forceinline__ void doubling(
 
     #pragma unroll
     for (int i = 0; i < N; ++i) {
-      float tex = -tau / d_mu[i];
-      float trans = (tex > -87.0f) ? expf(tex) : 0.0f;
+      float trans, one_minus_t, slope_term;
+      pure_absorption_source_terms(tau, d_mu[i], trans, one_minus_t, slope_term);
       layer.T_ab(i, i) = trans;
       layer.T_ba(i, i) = trans;
-      float one_minus_t = 1.0f - trans;
-      float slope_term = d_mu[i] * one_minus_t - 0.5f * tau * (1.0f + trans);
       layer.s_up[i]   = B_bar * one_minus_t + B_d * slope_term;
       layer.s_down[i] = B_bar * one_minus_t - B_d * slope_term;
     }

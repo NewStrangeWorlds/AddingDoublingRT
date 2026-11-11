@@ -1802,3 +1802,66 @@ class TestEnergyRenormalisation:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestThinPureAbsorption:
+    """Optically thin purely absorbing layers (tau 1e-9 .. 1e-5, omega = 0)
+    with a strong Planck gradient on top of an opaque stack: the upper layers
+    of a BeAR hot-Jupiter column. The thin-layer source terms must be
+    evaluated without cancellation (expm1 and the series of the slope term);
+    the direct form made every such layer emit -(B_bottom - B_top) per stream
+    in float32 (14% flux errors at 4.5 um in BeAR)."""
+
+    @staticmethod
+    def _column(with_thin):
+        n_thin = 25 if with_thin else 0
+        tau_thick = [0.01, 0.1, 1.0, 10.0, 100.0]
+        nlay = n_thin + len(tau_thick)
+        dtau = np.zeros(nlay); planck = np.zeros(nlay + 1)
+        for l in range(n_thin):
+            dtau[l] = 1e-9 * 10.0 ** (4.0 * l / 24.0)
+            planck[l] = 0.01 + (2.0 - 0.01) * l / 25.0
+        for k, t in enumerate(tau_thick):
+            dtau[n_thin + k] = t
+            planck[n_thin + k] = 2.0 + 3.0 * k / len(tau_thick)
+        planck[nlay] = 5.0
+        return dtau, planck
+
+    def _solve_f64(self, with_thin, nquad):
+        dtau, planck = self._column(with_thin)
+        cfg = ADConfig(num_layers=len(dtau), num_quadrature=nquad)
+        cfg.surface_albedo = 0.0
+        cfg.surface_emission = float(planck[-1])
+        cfg.allocate()
+        cfg.delta_tau[:] = dtau
+        cfg.single_scat_albedo[:] = 0.0
+        cfg.set_isotropic()
+        cfg.planck_levels = planck.copy()
+        return float(solve(cfg).flux_up[0])
+
+    def test_thin_stack_is_transparent_float64(self):
+        for nquad in (4, 8, 16):
+            full = self._solve_f64(True, nquad)
+            base = self._solve_f64(False, nquad)
+            assert full > 0.0
+            assert abs(full / base - 1.0) < 1e-4, (nquad, full, base)
+
+    def test_solve_batch_float32_matches_float64(self):
+        from src_jax.batch_solver import BatchConfig, solve_batch
+        dtau, planck = self._column(True)
+        nlay = len(dtau)
+        for nquad in (4, 8):
+            ref = self._solve_f64(True, nquad)
+            bc = BatchConfig()
+            bc.num_wavenumbers = 2
+            bc.num_layers = nlay
+            bc.num_quadrature = nquad
+            bc.num_moments_max = 2 * nquad
+            bc.surface_albedo = 0.0
+            pmom = np.zeros((nlay, 2 * nquad)); pmom[:, 0] = 1.0
+            for use_map in (False, True):
+                f_up, _ = solve_batch(bc, np.tile(dtau, (2, 1)), np.zeros((2, nlay)), pmom,
+                                      np.tile(planck, (2, 1)), use_map=use_map)
+                f_up = np.asarray(f_up)
+                assert np.all(np.isfinite(f_up))
+                np.testing.assert_allclose(f_up, ref, rtol=1e-3, err_msg=f"N={nquad} map={use_map}")
