@@ -66,6 +66,32 @@ __device__ __forceinline__ float doubling_path_integral(float tau0, float d, flo
   return (fabsf(u) < 1.0f) ? tau0 * e_i * doubling_phi(u) : (e_j - e_i) / d;
 }
 
+/// Row-wise energy renormalisation of R and T (port of
+/// adrt::renormalizeDoublingEnergy): rescale each row so that
+/// sum_j (T + R)(i, j) + y_i = 1 holds exactly. The identity is exact for the
+/// discrete doubling; the start's O((tau0/mu_min)^3) defect and the float
+/// round-off of the products (both amplified by 2^nn) otherwise act as a
+/// spurious absorption, which the flux through thick conservative layers
+/// feels at the 1/tau level (errors of 1e-2 .. 1 before this closure).
+/// Rows below 1e-6 (fully absorbed) are left alone.
+template<int N>
+__device__ __forceinline__ void renormalize_energy(
+    GpuMatrix<N>& R, GpuMatrix<N>& T, const GpuVec<N>& y) {
+  #pragma unroll
+  for (int i = 0; i < N; ++i) {
+    float rows = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < N; ++j)
+      rows += T(i, j) + R(i, j);
+    float f = (rows > 1e-6f) ? fmaxf(1.0f - y[i], 0.0f) / rows : 1.0f;
+    #pragma unroll
+    for (int j = 0; j < N; ++j) {
+      T(i, j) *= f;
+      R(i, j) *= f;
+    }
+  }
+}
+
 /// Doubling algorithm for a single homogeneous layer.
 ///
 /// @param layer          Output: reflection/transmission matrices + source vectors
@@ -222,6 +248,9 @@ __device__ __forceinline__ void doubling(
     z_k[i] = (1.0f - omega) * slope;
   }
 
+  // Energy closure of the start (see renormalize_energy)
+  renormalize_energy<N>(R_k, T_k, y_k);
+
   if (has_solar) {
     float inv_mu0 = 1.0f / solar_mu;
     float e_0 = expf(-tau0 * inv_mu0);
@@ -334,6 +363,7 @@ __device__ __forceinline__ void doubling(
 
     vec_copy<N>(y_k, y_new);
     vec_copy<N>(z_k, z_new);
+    renormalize_energy<N>(R_k, T_k, y_k);
     g_k = 2.0f * g_k;
   }
 

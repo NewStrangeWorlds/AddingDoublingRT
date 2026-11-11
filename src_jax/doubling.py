@@ -44,6 +44,28 @@ def _path_integral(tau0, d, e_i, e_j):
     return jnp.where(small, tau0 * e_i * _phi(u_safe), (e_j - e_i) / d_safe)
 
 
+def renormalize_energy(R, T, y):
+    """Row-wise energy renormalisation of a layer's operators.
+
+    In exact arithmetic the discrete doubling preserves
+        sum_j (T + R)_ij + y_i = 1
+    (y_i = absorbed fraction of unit intensity incident along mu_i) exactly.
+    The thin-layer start violates it by O((tau0/mu_min)^3) and float32
+    round-off by ~eps per product; the doubling multiplies both by 2^nn and
+    the result acts as a spurious absorption, to which the flux through thick
+    conservative layers is sensitive at the 1/tau level. Rescaling each row
+    of R and T to the absorbed fraction removes both. Applied after the start
+    and after every doubling step in all backends (CPU, CUDA, JAX).
+
+    Rows below 1e-6 (fully absorbed) are left alone. Broadcasts over leading
+    batch dimensions: R, T (..., N, N), y (..., N).
+    """
+    rows = jnp.sum(T, axis=-1) + jnp.sum(R, axis=-1)
+    safe = jnp.where(rows > 1e-6, rows, 1.0)
+    f = jnp.where(rows > 1e-6, jnp.maximum(1.0 - y, 0.0) / safe, 1.0)
+    return f[..., :, None] * R, f[..., :, None] * T
+
+
 def doubling_start(tau0, omega, Spp, Spm, mu,
                    F_top=None, p_plus=None, p_minus=None, solar_mu=None):
     """Thin-layer initialisation of the doubling recursion (port of
@@ -53,7 +75,9 @@ def doubling_start(tau0, omega, Spp, Spm, mu,
     double scattering tau0^2/2 * S^2, and a thermal source consistent with the
     absorbed fraction of the operators (Kirchhoff) through O(tau0^2):
         y_i = (1-omega) [ (1-e_i) + tau0^2/2 sum_k (Spp+Spm)_ik / mu_k ],
-    so that sum_j (T+R)_ij + y_i = 1 + O((tau0/mu_min)^3). Extinction and single scattering are exact for any tau0/mu, so the start
+    so that sum_j (T+R)_ij + y_i = 1 + O((tau0/mu_min)^3); the rows of R and T
+    are then rescaled so the identity holds exactly (renormalize_energy).
+    Extinction and single scattering are exact for any tau0/mu, so the start
     never leaves the physical range (the former first-order start
     T = I - tau0*Gpp blew up under doubling for tau0 > mu_min).
 
@@ -96,6 +120,9 @@ def doubling_start(tau0, omega, Spp, Spm, mu,
     slope_series = mu * x ** 3 * (-1.0 / 12.0 + x * (1.0 / 24.0 - x / 80.0))
     slope_direct = mu * a - 0.5 * t0v * (1.0 + e)
     z = (1.0 - omv) * jnp.where(x < x_small, slope_series, slope_direct)
+
+    # energy closure of the start (see renormalize_energy)
+    R, T = renormalize_energy(R, T, y)
 
     if F_top is None:
         zeros = jnp.zeros_like(y)
@@ -229,6 +256,7 @@ def doubling(tau, omega, B_top, B_bottom, Ppp, Ppm, mu, weights,
 
         z_new = (TG_zpgy - TGR_zpgy) + z_k - g_k * y_k
         y_new = TG_y + TGR_y + y_k
+        R_new, T_new = renormalize_energy(R_new, T_new, y_new)
 
         if has_solar:
             R_sdown = R_k @ s_down_sol_k

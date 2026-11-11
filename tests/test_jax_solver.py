@@ -1709,5 +1709,96 @@ class TestWeakScattering:
             assert abs(f_up[1] - f_up[0]) <= 2e-4 * f_up[0], (use_map, f_up)
 
 
+class TestEnergyRenormalisation:
+    """The discrete doubling preserves sum_j (T+R)_ij + y_i = 1 exactly; the
+    thin-layer start violates it by O((tau0/mu_min)^3), the float32 products
+    by ~eps per step, and the doubling amplifies both by 2**nn. Both are
+    removed by doubling.renormalize_energy (applied after the start and after
+    every step in all backends)."""
+
+    def test_layer_energy_identity(self):
+        from src_jax.quadrature import precompute_legendre_polynomials
+        from src_jax.phase_matrix import compute_phase_matrices
+        from src_jax.doubling import doubling
+        import jax.numpy as jnp
+        for nquad in (8, 16):
+            mu, wt = gauss_legendre(nquad)
+            Pl = precompute_legendre_polynomials(16, mu)
+            for g in (0.0, 0.7):
+                chi = jnp.array([g ** m for m in range(16)])
+                Ppp, Ppm = compute_phase_matrices(chi, mu, wt, Pl)
+                for omega, tau in ((1.0, 100.0), (0.999, 100.0), (0.5, 10.0), (0.01, 1.0)):
+                    r = doubling(tau, omega, 100.0, 150.0, Ppp, Ppm, mu, wt)
+                    T, R = np.asarray(r["T_ab"]), np.asarray(r["R_ab"])
+                    y = (np.asarray(r["s_up"]) + np.asarray(r["s_down"])) / 250.0
+                    defect = T.sum(1) + R.sum(1) + y - 1.0
+                    assert np.abs(defect).max() < 1e-8, (nquad, g, omega, tau, defect)
+
+    def test_thick_conservative_energy_balance(self):
+        """Black surface, omega = 1: reflected + transmitted = incident. The
+        transmitted flux is ~1/(1 + 3/4 tau (1-g)) of the input, so this
+        probes the energy balance of the doubling at the 1/tau level."""
+        for nquad in (8, 16):
+            for g in (0.0, 0.7):
+                for tau in (10.0, 100.0, 300.0):
+                    nlay = 5
+                    cfg = ADConfig(num_layers=nlay, num_quadrature=nquad)
+                    cfg.solar_flux = 1.0
+                    cfg.solar_mu = 0.5
+                    cfg.surface_albedo = 0.0
+                    cfg.allocate()
+                    cfg.delta_tau[:] = tau
+                    cfg.single_scat_albedo[:] = 1.0
+                    cfg.set_henyey_greenstein(g)
+                    r = solve(cfg)
+                    out = float(r.flux_up[0] + r.flux_down[nlay] + r.flux_direct[nlay])
+                    assert abs(out / 0.5 - 1.0) < 1e-6, (nquad, g, tau, out)
+                    assert float(r.flux_down[nlay]) > 0.0
+
+    def test_batch_solver_thick_conservative(self):
+        """solve_batch (float32) vs the float64 solve() for thick conservative
+        and near-conservative layers. Without the energy renormalisation the
+        float32 path was off by O(1) here (and by 4.6e-3 on the benchmark
+        atmosphere); with it the batched core tracks float64 to ~1e-4."""
+        from src_jax.batch_solver import BatchConfig, solve_batch
+        nlay = 5
+        pmom = np.array([[0.7 ** m for m in range(16)]] * nlay)
+        cases = [("solar", 1.0, 100.0), ("solar", 0.999, 30.0),
+                 ("thermal", 1.0, 100.0), ("thermal", 0.999, 100.0), ("thermal", 0.99, 10.0)]
+        for nquad in (8, 16):
+            for src, omega, tau in cases:
+                cfg = ADConfig(num_layers=nlay, num_quadrature=nquad)
+                cfg.allocate()
+                cfg.delta_tau[:] = tau
+                cfg.single_scat_albedo[:] = omega
+                cfg.set_henyey_greenstein(0.7)
+                planck = np.array([100.0 + 50.0 * l for l in range(nlay + 1)]) if src == "thermal" else np.zeros(nlay + 1)
+                cfg.planck_levels = planck.copy()
+                cfg.surface_emission = float(planck[-1])
+                if src == "solar":
+                    cfg.solar_flux = 1.0
+                    cfg.solar_mu = 0.5
+                    cfg.surface_albedo = 0.3
+                ref = solve(cfg)
+
+                bc = BatchConfig()
+                bc.num_wavenumbers = 2
+                bc.num_layers = nlay
+                bc.num_quadrature = nquad
+                bc.num_moments_max = 16
+                bc.surface_albedo = cfg.surface_albedo
+                bc.solar_flux = cfg.solar_flux
+                bc.solar_mu = cfg.solar_mu
+                dtau = np.tile(cfg.delta_tau, (2, 1))
+                ssa = np.tile(cfg.single_scat_albedo, (2, 1))
+                f_up, f_dn = solve_batch(bc, dtau, ssa, pmom, np.tile(planck, (2, 1)))
+                f_up, f_dn = np.asarray(f_up), np.asarray(f_dn)
+                assert np.all(np.isfinite(f_up)) and np.all(np.isfinite(f_dn))
+                np.testing.assert_allclose(f_up, float(ref.flux_up[0]), rtol=1e-3,
+                                           err_msg=f"{src} N={nquad} omega={omega} tau={tau}")
+                np.testing.assert_allclose(f_dn, float(ref.flux_down[nlay]), rtol=1e-3,
+                                           err_msg=f"{src} N={nquad} omega={omega} tau={tau}")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

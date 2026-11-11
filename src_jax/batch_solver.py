@@ -3,6 +3,28 @@
 Mirrors the CUDA batch solver interface. All wavenumbers share the same
 phase function moments but have different optical depths, SSA, and Planck values.
 The entire solve (all layers, doubling, adding) compiles into a single XLA program.
+
+Numerics (float32 throughout; measured 2026-11-11 on an RTX 5080, see
+tests/benchmark_all.py):
+  * The N x N products are written as broadcast-multiply-reduce so XLA fuses
+    them into one kernel each. cuBLAS batched GEMMs for 8 x 8 matrices ran
+    ~7x below the memory bound and the three-operand contractions of the
+    adding step lowered to a 1.1 ms cutlass kernel; together they were half
+    the runtime.
+  * The linear solves use a float32 Gauss-Jordan elimination without
+    pivoting, fused by XLA. The matrices I - R^2 and I - R_a R_b are
+    diagonally dominant; a pivoted float64 cuSOLVER LU gave results identical
+    to 1e-4 relative in every test case, but cost a quarter of the runtime.
+  * Doubling count: the CUDA rule (2/8/12, floor 6.6, cap log2(tau) + 12).
+    Float32 round-off grows as 2^nn * eps, so the float64 rule of the CPU
+    solver (uncapped, +16) gave O(1) errors for thick scattering layers.
+  * The rows of R and T are renormalised to the absorbed fraction after the
+    start and after every doubling step (doubling.renormalize_energy); that
+    removes the start truncation and the 2^nn round-off growth from the
+    energy balance and keeps thick conservative layers at ~1e-4.
+Overall: 1.8 s -> 0.4 s for 100 layers x 20000 wavenumbers at N = 8 (CUDA:
+0.023 s), and the error against a float64 run of the same core dropped from
+4.6e-3 to 1e-6.
 """
 
 import functools
@@ -13,22 +35,49 @@ import numpy as np
 
 from .quadrature import gauss_legendre, precompute_legendre_polynomials
 from .phase_matrix import compute_phase_matrices, compute_solar_phase_vectors
-from .doubling import doubling_start
+from .doubling import doubling_start, renormalize_energy
 
 PI = jnp.pi
 
 
+def _gauss_jordan(A, B):
+    """Solve A X = B for a batch of small systems, A (..., n, n), B (..., n, m),
+    by Gauss-Jordan elimination without pivoting in the dtype of A. Every step
+    is an elementwise op on the full batch, so XLA fuses the whole solve.
+    Valid for the diagonally dominant matrices of the adding/doubling
+    recursion (I - R^2, I - R_a R_b)."""
+    n = A.shape[-1]
+    for k in range(n):
+        piv = A[..., k:k + 1, k:k + 1]                                 # (..., 1, 1)
+        row_a = A[..., k:k + 1, :] / piv                               # (..., 1, n)
+        row_b = B[..., k:k + 1, :] / piv                               # (..., 1, m)
+        col = A[..., :, k:k + 1]                                       # (..., n, 1)
+        m = (jnp.arange(n) != k)[:, None]                              # rows != k
+        A = jnp.where(m, A - col * row_a, row_a)
+        B = jnp.where(m, B - col * row_b, row_b)
+    return B
+
+
 def _batch_solve_vec(A, b):
-    """Batched solve A x = b. Float32 interface, float64 LU for stability."""
-    x = jnp.linalg.solve(A.astype(jnp.float64), b[..., None].astype(jnp.float64))
-    return x.squeeze(-1).astype(jnp.float32)
+    """Batched solve A x = b, A (nwav, N, N), b (nwav, N)."""
+    return _gauss_jordan(A, b[..., None])[..., 0]
 
 
 def _right_solve_batched(A, B):
-    """Batched right solve: X A = B. Float32 interface, float64 LU for stability."""
-    AT = jnp.swapaxes(A, -2, -1).astype(jnp.float64)
-    BT = jnp.swapaxes(B, -2, -1).astype(jnp.float64)
-    return jnp.linalg.solve(AT, BT).swapaxes(-2, -1).astype(jnp.float32)
+    """Batched right solve X A = B (as A^T X^T = B^T)."""
+    AT = jnp.swapaxes(A, -2, -1)
+    BT = jnp.swapaxes(B, -2, -1)
+    return jnp.swapaxes(_gauss_jordan(AT, BT), -2, -1)
+
+
+def _bmm(A, B):
+    """Batched matrix product (b, i, j) x (b, j, k) as a fused multiply-reduce."""
+    return jnp.sum(A[:, :, :, None] * B[:, None, :, :], axis=2)
+
+
+def _bmv(A, v):
+    """Batched matrix-vector product (b, i, j) x (b, j)."""
+    return jnp.sum(A * v[:, None, :], axis=2)
 
 
 # ============================================================================
@@ -41,34 +90,35 @@ def _doubling_step(carry, _):
     N = R_k.shape[-1]
     I_mat = jnp.eye(N, dtype=jnp.float32)
 
-    R_sq = jnp.einsum("bij,bjk->bik", R_k, R_k)
+    R_sq = _bmm(R_k, R_k)
     I_minus_R2 = I_mat[None] - R_sq
 
     TG = _right_solve_batched(I_minus_R2, T_k)
-    TGR = jnp.einsum("bij,bjk->bik", TG, R_k)
+    TGR = _bmm(TG, R_k)
 
-    R_new = R_k + jnp.einsum("bij,bjk->bik", TGR, T_k)
-    T_new = jnp.einsum("bij,bjk->bik", TG, T_k)
+    R_new = R_k + _bmm(TGR, T_k)
+    T_new = _bmm(TG, T_k)
 
     zpgy = z_k + g_k[:, None] * y_k
-    TG_zpgy = jnp.einsum("bij,bj->bi", TG, zpgy)
-    TGR_zpgy = jnp.einsum("bij,bj->bi", TGR, zpgy)
-    TG_y = jnp.einsum("bij,bj->bi", TG, y_k)
-    TGR_y = jnp.einsum("bij,bj->bi", TGR, y_k)
+    TG_zpgy = _bmv(TG, zpgy)
+    TGR_zpgy = _bmv(TGR, zpgy)
+    TG_y = _bmv(TG, y_k)
+    TGR_y = _bmv(TGR, y_k)
 
     z_new = (TG_zpgy - TGR_zpgy) + z_k - g_k[:, None] * y_k
     y_new = TG_y + TGR_y + y_k
+    R_new, T_new = renormalize_energy(R_new, T_new, y_new)
     g_new = 2.0 * g_k
 
     # Solar source doubling
-    R_sdown = jnp.einsum("bij,bj->bi", R_k, s_down_sol)
-    R_sup = jnp.einsum("bij,bj->bi", R_k, s_up_sol)
+    R_sdown = _bmv(R_k, s_down_sol)
+    R_sup = _bmv(R_k, s_up_sol)
 
     rhs_up = R_sdown + gamma_sol[:, None] * s_up_sol
     rhs_down = gamma_sol[:, None] * R_sup + s_down_sol
 
-    s_up_sol_new = jnp.einsum("bij,bj->bi", TG, rhs_up) + s_up_sol
-    s_down_sol_new = (jnp.einsum("bij,bj->bi", TG, rhs_down)
+    s_up_sol_new = _bmv(TG, rhs_up) + s_up_sol
+    s_down_sol_new = (_bmv(TG, rhs_down)
                       + gamma_sol[:, None] * s_down_sol)
     gamma_sol_new = gamma_sol * gamma_sol
 
@@ -88,26 +138,26 @@ def _add_layers(top, bot):
     N = R_ab_t.shape[-1]
     I_mat = jnp.eye(N, dtype=jnp.float32)
 
-    A1 = I_mat[None] - jnp.einsum("bij,bjk->bik", R_ab_b, R_ba_t)
-    A2 = I_mat[None] - jnp.einsum("bij,bjk->bik", R_ba_t, R_ab_b)
+    A1 = I_mat[None] - _bmm(R_ab_b, R_ba_t)
+    A2 = I_mat[None] - _bmm(R_ba_t, R_ab_b)
 
     T_ba_D1 = _right_solve_batched(A1, T_ba_t)
     T_bc_D2 = _right_solve_batched(A2, T_ab_b)
 
-    R_ab = R_ab_t + jnp.einsum("bij,bjk,bkl->bil", T_ba_D1, R_ab_b, T_ab_t)
-    R_ba = R_ba_b + jnp.einsum("bij,bjk,bkl->bil", T_bc_D2, R_ba_t, T_ba_b)
-    T_ab = jnp.einsum("bij,bjk->bik", T_bc_D2, T_ab_t)
-    T_ba = jnp.einsum("bij,bjk->bik", T_ba_D1, T_ba_b)
+    R_ab = R_ab_t + _bmm(_bmm(T_ba_D1, R_ab_b), T_ab_t)
+    R_ba = R_ba_b + _bmm(_bmm(T_bc_D2, R_ba_t), T_ba_b)
+    T_ab = _bmm(T_bc_D2, T_ab_t)
+    T_ba = _bmm(T_ba_D1, T_ba_b)
 
-    Rbc_sd = jnp.einsum("bij,bj->bi", R_ab_b, sd_t)
-    s_up = su_t + jnp.einsum("bij,bj->bi", T_ba_D1, su_b + Rbc_sd)
-    Rba_su = jnp.einsum("bij,bj->bi", R_ba_t, su_b)
-    s_down = sd_b + jnp.einsum("bij,bj->bi", T_bc_D2, sd_t + Rba_su)
+    Rbc_sd = _bmv(R_ab_b, sd_t)
+    s_up = su_t + _bmv(T_ba_D1, su_b + Rbc_sd)
+    Rba_su = _bmv(R_ba_t, su_b)
+    s_down = sd_b + _bmv(T_bc_D2, sd_t + Rba_su)
 
-    Rbc_sds = jnp.einsum("bij,bj->bi", R_ab_b, sds_t)
-    s_up_sol = sus_t + jnp.einsum("bij,bj->bi", T_ba_D1, sus_b + Rbc_sds)
-    Rba_sus = jnp.einsum("bij,bj->bi", R_ba_t, sus_b)
-    s_down_sol = sds_b + jnp.einsum("bij,bj->bi", T_bc_D2, sds_t + Rba_sus)
+    Rbc_sds = _bmv(R_ab_b, sds_t)
+    s_up_sol = sus_t + _bmv(T_ba_D1, sus_b + Rbc_sds)
+    Rba_sus = _bmv(R_ba_t, sus_b)
+    s_down_sol = sds_b + _bmv(T_bc_D2, sds_t + Rba_sus)
 
     return (R_ab, R_ba, T_ab, T_ba, s_up, s_down, s_up_sol, s_down_sol)
 
@@ -275,9 +325,9 @@ def _solve_core(nlay, N, nn_layers, has_surface,
         base_at_boa = surface
         top_c = rtop_at_nlay
         base_c = base_at_boa
-        to_inv = I_batch - jnp.einsum("bij,bjk->bik", top_c[1], base_c[0])
+        to_inv = I_batch - _bmm(top_c[1], base_c[0])
         rhs = (top_c[5] + top_c[7]
-               + jnp.einsum("bij,bj->bi", top_c[1], base_c[4] + base_c[6]))
+               + _bmv(top_c[1], base_c[4] + base_c[6]))
         Idown_boa = _batch_solve_vec(to_inv, rhs)
     else:
         Idown_boa = rtop_at_nlay[5] + rtop_at_nlay[7]
@@ -396,6 +446,7 @@ def _solve_core_map(nlay, N, nn_wl, has_surface,
                 zpgy  = z + g * y
                 z_new = (TG @ zpgy - TGR @ zpgy) + z - g * y
                 y_new = TG @ y + TGR @ y + y
+                R_new, T_new = renormalize_energy(R_new, T_new, y_new)
                 g_new = 2.0 * g
 
                 rhs_up   = R @ sd_s + gam * su_s
@@ -481,19 +532,24 @@ class BatchConfig:
 def _compute_nn_layers(delta_tau, ssa, mu_min):
     """Per-(wavenumber, layer) doubling counts, shape (nwav, nlay), int32.
 
-    Omega-adaptive rule plus the omega-scaled extinction floor
-    nn >= log2(tau/mu_min) + 0.5*log2(omega) + 7.6 (mirrors
-    adrt::computeDoublingCount). Non-scattering or empty entries get 1:
-    the thin-layer start is exact for omega = 0 at any tau0.
+    Mirrors the CUDA rule (compute_doubling_count in cuda_doubling.cuh):
+    omega-adaptive start ipow0 = (2, 8, 12) plus the omega-scaled extinction
+    floor nn >= log2(tau/mu_min) + 0.5*log2(omega) + 6.6, capped at
+    log2(tau) + 12. The float64 CPU rule (4, 10, 16; +7.6; uncapped) is not
+    usable in float32: round-off grows as 2^nn * eps and gave O(1) errors
+    for thick scattering layers. Non-scattering or empty entries get 1: the
+    thin-layer start is exact for omega = 0 at any tau0.
     """
     tau = np.asarray(delta_tau, dtype=np.float64)
     omega = np.asarray(ssa, dtype=np.float64)
     mask = (omega > 0.0) & (tau > 0.0)
     tau_s = np.where(mask, tau, 1.0)
-    ipow0 = np.where(omega < 0.01, 4, np.where(omega < 0.1, 10, 16))
-    nn = np.floor(np.log2(tau_s)).astype(int) + ipow0
+    log2tau = np.floor(np.log2(tau_s)).astype(int)
+    ipow0 = np.where(omega < 0.01, 2, np.where(omega < 0.1, 8, 12))
+    nn = log2tau + ipow0
     n_ext = np.ceil(np.log2(tau_s / mu_min)
-                    + 0.5 * np.log2(np.maximum(omega, 1e-8)) + 7.6).astype(int)
+                    + 0.5 * np.log2(np.maximum(omega, 1e-8)) + 6.6).astype(int)
+    n_ext = np.minimum(n_ext, log2tau + 12)
     nn = np.maximum(1, np.maximum(nn, n_ext))
     return np.where(mask, nn, 1).astype(np.int32)
 

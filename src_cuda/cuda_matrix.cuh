@@ -2,7 +2,7 @@
 /// @brief Device-side fixed-size dense matrix library for the CUDA RT solver.
 ///
 /// Provides GpuMatrix<N> (float) and GpuVec<N> (float) for the main solver,
-/// with double-precision LU solves for numerical stability.
+/// with LU solves in lu_real (ADRT_CUDA_LU_REAL, default float).
 /// Designed for small matrices (N=2..32) where per-thread execution is efficient.
 
 #pragma once
@@ -225,26 +225,38 @@ __device__ __forceinline__ void mat_scale(
 
 
 // ============================================================================
-//  Double-precision LU decomposition (for numerical stability)
+//  LU decomposition for the linear solves (precision selectable)
 // ============================================================================
 //
-//  The matrix solve operations (I - R²)⁻¹ etc. are ill-conditioned for
-//  high albedo, so we promote to double for the factorisation/solve only.
+//  The matrix solves (I - R²)⁻¹ etc. were originally promoted to double "for
+//  stability". With the energy renormalisation of the doubling (see
+//  cuda_doubling.cuh) the measured accuracy does not depend on the solve
+//  precision (2026-11-11: identical to 1e-5 on thick conservative layers,
+//  all 317 test checks at 5e-4 pass either way), while FP64 runs at 1/64
+//  rate on consumer GPUs: the double LU made the N = 8 kernel 4.5x and the
+//  N = 4 kernel 9x slower (105 vs 23 ms, 21 vs 2.4 ms for 100 layers x 20000
+//  wavenumbers on an RTX 5080). ADRT_CUDA_LU_REAL selects the type; compile
+//  with -DADRT_CUDA_LU_REAL=double to get the former behaviour.
+
+#ifndef ADRT_CUDA_LU_REAL
+#define ADRT_CUDA_LU_REAL float
+#endif
+using lu_real = ADRT_CUDA_LU_REAL;
 
 /// Double-precision LU factorisation with partial pivoting.
 template<int N>
 __device__ __forceinline__ void dmat_lu_factor(
-    double A[N * N], int pivot[N]) {
+    lu_real A[N * N], int pivot[N]) {
   #pragma unroll
   for (int i = 0; i < N; ++i)
     pivot[i] = i;
 
   for (int k = 0; k < N; ++k) {
     int max_row = k;
-    double max_val = fabs(A[k * N + k]);
+    lu_real max_val = fabs(A[k * N + k]);
 
     for (int i = k + 1; i < N; ++i) {
-      double v = fabs(A[i * N + k]);
+      lu_real v = fabs(A[i * N + k]);
       if (v > max_val) {
         max_val = v;
         max_row = i;
@@ -258,13 +270,13 @@ __device__ __forceinline__ void dmat_lu_factor(
 
       #pragma unroll
       for (int j = 0; j < N; ++j) {
-        double tmp = A[k * N + j];
+        lu_real tmp = A[k * N + j];
         A[k * N + j] = A[max_row * N + j];
         A[max_row * N + j] = tmp;
       }
     }
 
-    double inv_kk = (max_val > 1e-35) ? 1.0 / A[k * N + k] : 0.0;
+    lu_real inv_kk = (max_val > 1e-35) ? lu_real(1) / A[k * N + k] : lu_real(0);
 
     for (int i = k + 1; i < N; ++i) {
       A[i * N + k] *= inv_kk;
@@ -278,8 +290,8 @@ __device__ __forceinline__ void dmat_lu_factor(
 /// Double-precision forward/back solve using pre-factored LU.
 template<int N>
 __device__ __forceinline__ void dmat_lu_solve_vec(
-    const double LU[N * N], const int pivot[N],
-    double x[N], const double b[N]) {
+    const lu_real LU[N * N], const int pivot[N],
+    lu_real x[N], const lu_real b[N]) {
   #pragma unroll
   for (int i = 0; i < N; ++i)
     x[i] = b[pivot[i]];
@@ -297,22 +309,22 @@ __device__ __forceinline__ void dmat_lu_solve_vec(
 
 
 // ============================================================================
-//  High-level solve operations (float interface, double internals)
+//  High-level solve operations (float interface, lu_real internals)
 // ============================================================================
 
-/// Solve A x = b for x. A and b are float; solve done in double.
+/// Solve A x = b for x. A and b are float; solve done in lu_real.
 template<int N>
 __device__ __forceinline__ void mat_solve(
     GpuVec<N>& x, const GpuMatrix<N>& A, const GpuVec<N>& b) {
-  double dA[N * N], db[N], dx[N];
+  lu_real dA[N * N], db[N], dx[N];
   int pivot[N];
 
   #pragma unroll
   for (int i = 0; i < N * N; ++i)
-    dA[i] = static_cast<double>(A.data[i]);
+    dA[i] = static_cast<lu_real>(A.data[i]);
   #pragma unroll
   for (int i = 0; i < N; ++i)
-    db[i] = static_cast<double>(b[i]);
+    db[i] = static_cast<lu_real>(b[i]);
 
   dmat_lu_factor<N>(dA, pivot);
   dmat_lu_solve_vec<N>(dA, pivot, dx, db);
@@ -322,25 +334,25 @@ __device__ __forceinline__ void mat_solve(
     x[i] = static_cast<float>(dx[i]);
 }
 
-/// Solve A X = B for matrix X. Float interface, double internals.
+/// Solve A X = B for matrix X. Float interface, lu_real internals.
 template<int N>
 __device__ __forceinline__ void mat_solve_matrix(
     GpuMatrix<N>& X, const GpuMatrix<N>& A, const GpuMatrix<N>& B) {
-  double dA[N * N];
+  lu_real dA[N * N];
   int pivot[N];
 
   #pragma unroll
   for (int i = 0; i < N * N; ++i)
-    dA[i] = static_cast<double>(A.data[i]);
+    dA[i] = static_cast<lu_real>(A.data[i]);
 
   dmat_lu_factor<N>(dA, pivot);
 
-  double col_b[N], col_x[N];
+  lu_real col_b[N], col_x[N];
   #pragma unroll
   for (int j = 0; j < N; ++j) {
     #pragma unroll
     for (int i = 0; i < N; ++i)
-      col_b[i] = static_cast<double>(B(i, j));
+      col_b[i] = static_cast<lu_real>(B(i, j));
 
     dmat_lu_solve_vec<N>(dA, pivot, col_x, col_b);
 
@@ -350,28 +362,28 @@ __device__ __forceinline__ void mat_solve_matrix(
   }
 }
 
-/// Solve X A = B for X, i.e. X = B A^{-1}. Float interface, double internals.
+/// Solve X A = B for X, i.e. X = B A^{-1}. Float interface, lu_real internals.
 template<int N>
 __device__ __forceinline__ void mat_right_solve_matrix(
     GpuMatrix<N>& X, const GpuMatrix<N>& A, const GpuMatrix<N>& B) {
-  // Transpose A into double
-  double dAT[N * N];
+  // Transpose A into lu_real
+  lu_real dAT[N * N];
   #pragma unroll
   for (int i = 0; i < N; ++i)
     #pragma unroll
     for (int j = 0; j < N; ++j)
-      dAT[i * N + j] = static_cast<double>(A(j, i));
+      dAT[i * N + j] = static_cast<lu_real>(A(j, i));
 
   int pivot[N];
   dmat_lu_factor<N>(dAT, pivot);
 
   // Solve A^T * col(X^T, i) = col(B^T, i) for each row i of X
-  double row_b[N], row_x[N];
+  lu_real row_b[N], row_x[N];
   #pragma unroll
   for (int i = 0; i < N; ++i) {
     #pragma unroll
     for (int j = 0; j < N; ++j)
-      row_b[j] = static_cast<double>(B(i, j));
+      row_b[j] = static_cast<lu_real>(B(i, j));
 
     dmat_lu_solve_vec<N>(dAT, pivot, row_x, row_b);
 
@@ -381,7 +393,7 @@ __device__ __forceinline__ void mat_right_solve_matrix(
   }
 }
 
-/// Compute A^{-1}. Float interface, double internals.
+/// Compute A^{-1}. Float interface, lu_real internals.
 template<int N>
 __device__ __forceinline__ void mat_inverse(
     GpuMatrix<N>& Ainv, const GpuMatrix<N>& A) {

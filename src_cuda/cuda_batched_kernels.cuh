@@ -472,6 +472,35 @@ __global__ void batchedThermalSourceCombineKernel(
 }
 
 /// Update g_k *= 2
+/// Row-wise energy renormalisation of R_k and T_k (one thread per row):
+/// rescale row i of both so that sum_j (T + R)(i, j) + y_i = 1 exactly.
+/// See renormalize_energy in cuda_doubling.cuh / adrt::renormalizeDoublingEnergy.
+__global__ void batchedRenormalizeEnergyKernel(
+    int nwav, int N,
+    const float* __restrict__ y_k,   // [nwav * N]
+    float* __restrict__ R_k,         // [nwav * N*N]
+    float* __restrict__ T_k)         // [nwav * N*N]
+{
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= nwav * N) return;
+
+  int w = idx / N;
+  int i = idx % N;
+  float* R_row = R_k + (size_t)w * N * N + (size_t)i * N;
+  float* T_row = T_k + (size_t)w * N * N + (size_t)i * N;
+
+  float rows = 0.0f;
+  for (int j = 0; j < N; ++j)
+    rows += T_row[j] + R_row[j];
+  if (rows <= 1e-6f) return;
+
+  float f = fmaxf(1.0f - y_k[idx], 0.0f) / rows;
+  for (int j = 0; j < N; ++j) {
+    T_row[j] *= f;
+    R_row[j] *= f;
+  }
+}
+
 __global__ void batchedDoubleGkKernel(int nwav, float* __restrict__ g_k) {
   int w = blockIdx.x * blockDim.x + threadIdx.x;
   if (w >= nwav) return;

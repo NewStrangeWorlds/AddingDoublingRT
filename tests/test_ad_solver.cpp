@@ -2133,6 +2133,45 @@ TEST(ADSolver, RayleighSphericalAlbedo) {
 
 
 // ============================================================================
+//  Regression: energy balance of thick conservative layers
+// ============================================================================
+
+TEST(ADSolver, ThickConservativeEnergyBalance) {
+  // Conservative layers, black surface: all incident solar energy leaves the
+  // column as reflected or transmitted flux. The flux through a thick
+  // conservative slab is ~1/(1 + 3/4 tau (1-g)) of the input and therefore
+  // sensitive to the energy balance of the doubling at the 1/tau level.
+  // Before the row-wise energy renormalisation of the doubling start
+  // (renormalizeDoublingEnergy) the O((tau0/mu_min)^3) defect of the start,
+  // multiplied by 2^nn, lost 2e-3 (tau = 100 per layer) to 1e-2 (tau = 300)
+  // of the energy even in double precision.
+  for (int nquad : {6, 8, 16}) {          // 6 = dynamic path
+    for (double g : {0.0, 0.7}) {
+      for (double tau : {10.0, 100.0, 300.0}) {
+        const int nlay = 5;
+        adrt::ADConfig cfg(nlay, nquad);
+        cfg.solar_flux = 1.0;
+        cfg.solar_mu = 0.5;
+        cfg.surface_albedo = 0.0;
+        cfg.allocate();
+        for (int l = 0; l < nlay; ++l) {
+          cfg.delta_tau[l] = tau;
+          cfg.single_scat_albedo[l] = 1.0;
+        }
+        cfg.setHenyeyGreenstein(g);
+
+        auto r = adrt::solve(cfg);
+        const double in  = cfg.solar_flux * cfg.solar_mu;
+        const double out = r.flux_up[0] + r.flux_down[nlay] + r.flux_direct[nlay];
+        EXPECT_NEAR(out / in, 1.0, 1e-6);
+        EXPECT_GT(r.flux_down[nlay], 0.0);
+      }
+    }
+  }
+}
+
+
+// ============================================================================
 //  Regression: Double Henyey-Greenstein phase function moments
 // ============================================================================
 

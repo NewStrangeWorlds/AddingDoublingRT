@@ -78,6 +78,47 @@ inline double doublingPathIntegral(double tau0, double d, double e_i, double e_j
 }
 
 
+/// Energy renormalisation of a layer's operators (row-wise).
+///
+/// In exact arithmetic the discrete doubling preserves the identity
+///   sum_j (T + R)(i, j) + y_i = 1
+/// (y_i = absorbed fraction of unit intensity incident along mu_i) exactly:
+/// it holds for the thin-layer start through O(tau0^2) and the adding
+/// equations conserve energy. Two things break it in practice: the start's
+/// O((tau0/mu_min)^3) defect, which the doubling multiplies by 2^nn and which
+/// acts as a spurious absorption in conservative layers (the flux through a
+/// thick layer with omega = 1 is sensitive to the energy balance at the
+/// 1/tau level), and, in single precision, the round-off of the products,
+/// which grows as 2^nn * eps. Rescaling each row of R and T to the absorbed
+/// fraction removes both without changing the angular distribution beyond
+/// the error already present. Applied after the start and after every
+/// doubling step by all backends (CPU, CUDA, JAX).
+///
+/// Rows whose total is below 1e-6 (practically fully absorbed) are left
+/// alone: the ratio is then round-off and the energy at stake negligible.
+template<class Mat, class Vec>
+inline void renormalizeDoublingEnergy(Mat& R, Mat& T, const Vec& y, const int n)
+{
+  for (int i = 0; i < n; ++i)
+  {
+    double rows = 0.0;
+
+    for (int j = 0; j < n; ++j)
+      rows += T(i, j) + R(i, j);
+
+    if (rows <= 1e-6) continue;
+
+    const double f = std::max(1.0 - y[i], 0.0) / rows;
+
+    for (int j = 0; j < n; ++j)
+    {
+      T(i, j) *= f;
+      R(i, j) *= f;
+    }
+  }
+}
+
+
 /// Thin-layer initialisation of the doubling recursion.
 ///
 /// For a homogeneous sub-layer of optical depth tau0 with scattering operators
@@ -97,7 +138,9 @@ inline double doublingPathIntegral(double tau0, double d, double e_i, double e_j
 /// The thermal source is the absorbed fraction of the same operators
 /// (Kirchhoff), consistent through O(tau0^2):
 ///   y_i = (1-omega) * [ (1 - e_i) + tau0^2/2 * sum_k (Spp+Spm)(i,k) / mu_k ]
-/// so that sum_j (T+R)(i,j) + y_i = 1 + O((tau0/mu_min)^3) and y == 0 for omega = 1.
+/// so that sum_j (T+R)(i,j) + y_i = 1 + O((tau0/mu_min)^3) and y == 0 for omega = 1;
+/// the rows of R and T are then rescaled so the identity holds exactly
+/// (renormalizeDoublingEnergy).
 /// z (the linear-in-tau source gradient term) is the pure-absorption value,
 /// O(tau0^3). The solar source uses the same exact-single + Taylor-double
 /// treatment with the direct beam attenuated along its own path.
@@ -178,6 +221,9 @@ void initDoublingStart(
 
     z[i] = (1.0 - omega) * slope;
   }
+
+  // --- energy closure of the start (see renormalizeDoublingEnergy) ---
+  renormalizeDoublingEnergy(R, T, y, n);
 
   // --- solar source ---
   if (has_solar) 
@@ -347,6 +393,8 @@ LayerMatrices<N> doubling(
       z_new[i] = (TG_zpgy[i] - TGR_zpgy[i]) + z_k[i] - g_k * y_k[i];
       y_new[i] = TG_y[i] + TGR_y[i] + y_k[i];
     }
+
+    renormalizeDoublingEnergy(R_new, T_new, y_new, N);
 
     Vec s_up_sol_new = Vec::Zero(), s_down_sol_new = Vec::Zero();
     

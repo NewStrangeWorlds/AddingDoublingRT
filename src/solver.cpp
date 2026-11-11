@@ -1192,6 +1192,8 @@ static DynLayerMatrices dynDoubling(
       y_new[i] = TG_y[i] + TGR_y[i] + y_k[i];
     }
 
+    renormalizeDoublingEnergy(R_new, T_new, y_new, n);
+
     std::vector<double> s_up_sol_new(n, 0.0), s_down_sol_new(n, 0.0);
     
     if (has_solar) 

@@ -21,12 +21,14 @@ An implementation of the adding-doubling method for solving the radiative transf
 
 - Batched solver processing all wavenumbers in parallel (one CUDA thread per wavenumber)
 - Template-specialised kernels (`solveKernel<N>`) for N = 2, 4, 8, 16 with register-resident matrix operations
-- Double-precision LU factorisation for linear systems
+- Single-precision throughout; the LU solves can be switched back to double at compile time (`-DADRT_CUDA_LU_REAL=double`, 4.5x slower at N=8 for no measurable accuracy gain)
+- Row-wise energy renormalisation of the doubling (all backends): float32 results track the double-precision solver to ~1e-4 even for thick conservative layers
 - Shared or per-wavenumber phase function moments
 
 ### JAX solver
 
 - Pure-Python implementation using JAX for automatic differentiation and GPU acceleration
+- Batched solver (`solve_batch`) runs in float32 with XLA-fused matrix products and a fused Gauss-Jordan solve (0.37 s for 100 layers x 20000 wavenumbers at N=8 on an RTX 5080; CUDA: 0.023 s)
 - **Single-wavenumber solver** (`solve`) matching the C++ API
 - **Batched solver** (`solve_batch`) vectorised across wavenumbers via `jnp.einsum` and `jax.lax.scan`
 - Float64 precision by default
@@ -86,7 +88,7 @@ cd build && ctest --output-on-failure
 ### JAX
 
 ```bash
-# Run the JAX test suite (63 tests)
+# Run the JAX test suite (72 tests)
 pytest tests/test_jax_solver.py -v
 
 # Run the 3-way performance benchmark (C++ CPU vs CUDA vs JAX)
@@ -210,7 +212,7 @@ src/
 src_cuda/
   cuda_solver.cuh      -- Public CUDA API: BatchConfig, DeviceData, solveBatch()
   cuda_solver.cu       -- Kernel dispatch and template instantiation
-  cuda_matrix.cuh      -- GpuMatrix<N>/GpuVec<N>, LU solve (double precision)
+  cuda_matrix.cuh      -- GpuMatrix<N>/GpuVec<N>, LU solve (float, ADRT_CUDA_LU_REAL)
   cuda_doubling.cuh    -- Doubling iteration (register-resident)
   cuda_adding.cuh      -- Layer combination
   cuda_layer.cuh       -- Per-thread layer data structures

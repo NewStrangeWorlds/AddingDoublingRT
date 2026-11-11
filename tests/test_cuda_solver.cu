@@ -1357,20 +1357,30 @@ void test_conservative_thick() {
 
     char buf[256];
     snprintf(buf, sizeof(buf), "%s_flux_up", label);
-    CHECK_NEAR(buf, cuda.flux_up, cpu.flux_up[0], tol);
+    CHECK_NEAR(buf, cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], tol));
     snprintf(buf, sizeof(buf), "%s_flux_down", label);
-    CHECK_NEAR(buf, cuda.flux_down, cpu.flux_down[0], tol);
+    CHECK_NEAR(buf, cuda.flux_down, cpu.flux_down[0], rtol(cpu.flux_down[0], tol));
   };
 
+  // Surface emission transmitted through conservative layers: the flux is
+  // ~1/(1 + 3/4 tau_tot (1-g)) of the source and sensitive to the energy
+  // balance of the doubling at the 1/tau level. Before the energy
+  // renormalisation of the doubling (renormalize_energy) the single-precision
+  // kernels were off by 1e-2 at tau = 5 and 100% at tau >= 100 per layer;
+  // now they agree with the CPU to < 1e-4 up to tau = 300 per layer.
   // Per-thread path (N=4, N=8)
-  run_case(10, 5.0, 4, 0.0, 1.0, "N4_iso_tau50");
-  run_case(20, 5.0, 8, 0.8, 1.0, "N8_hg08_tau100");
-  run_case(1, 100.0, 8, 0.0, 1.0, "N8_iso_tau100_1lay");
+  run_case(10, 5.0, 4, 0.0, 5e-4, "N4_iso_tau50");
+  run_case(20, 5.0, 8, 0.8, 5e-4, "N8_hg08_tau100");
+  run_case(1, 100.0, 8, 0.0, 5e-4, "N8_iso_tau100_1lay");
+  run_case(5, 100.0, 8, 0.7, 5e-4, "N8_hg07_tau500");
+  run_case(5, 300.0, 8, 0.0, 5e-4, "N8_iso_tau1500");
 
   // Batched cuBLAS path (N=16)
-  run_case(10, 5.0, 16, 0.0, 1.0, "N16_iso_tau50");
-  run_case(20, 5.0, 16, 0.8, 2.0, "N16_hg08_tau100");
-  run_case(1, 100.0, 16, 0.0, 1.0, "N16_iso_tau100_1lay");
+  run_case(10, 5.0, 16, 0.0, 5e-4, "N16_iso_tau50");
+  run_case(20, 5.0, 16, 0.8, 5e-4, "N16_hg08_tau100");
+  run_case(1, 100.0, 16, 0.0, 5e-4, "N16_iso_tau100_1lay");
+  run_case(5, 100.0, 16, 0.7, 5e-4, "N16_hg07_tau500");
+  run_case(5, 300.0, 16, 0.0, 5e-4, "N16_iso_tau1500");
 
   std::cout << "done\n";
 }
@@ -1400,19 +1410,23 @@ void test_conservative_solar_energy() {
 
     char buf[256];
     snprintf(buf, sizeof(buf), "%s_flux_up", label);
-    CHECK_NEAR(buf, cuda.flux_up, cpu.flux_up[0], tol);
+    CHECK_NEAR(buf, cuda.flux_up, cpu.flux_up[0], rtol(cpu.flux_up[0], tol));
     snprintf(buf, sizeof(buf), "%s_flux_down", label);
-    CHECK_NEAR(buf, cuda.flux_down, cpu.flux_down[0], tol);
+    CHECK_NEAR(buf, cuda.flux_down, cpu.flux_down[0], rtol(cpu.flux_down[0], tol));
   };
 
   // Per-thread path
-  run_case(4, 10.0, 0.0, 5e-3, "N4_iso_tau10");
-  run_case(8, 10.0, 0.0, 5e-3, "N8_iso_tau10");
-  run_case(8, 10.0, 0.85, 5e-3, "N8_hg085_tau10");
+  run_case(4, 10.0, 0.0, 5e-4, "N4_iso_tau10");
+  run_case(8, 10.0, 0.0, 5e-4, "N8_iso_tau10");
+  run_case(8, 10.0, 0.85, 5e-4, "N8_hg085_tau10");
+  run_case(8, 500.0, 0.0, 5e-4, "N8_iso_tau500");
+  run_case(8, 1500.0, 0.7, 5e-4, "N8_hg07_tau1500");
 
   // Batched cuBLAS path
-  run_case(16, 10.0, 0.0, 5e-2, "N16_iso_tau10");
-  run_case(16, 10.0, 0.85, 5e-2, "N16_hg085_tau10");
+  run_case(16, 10.0, 0.0, 5e-4, "N16_iso_tau10");
+  run_case(16, 10.0, 0.85, 5e-4, "N16_hg085_tau10");
+  run_case(16, 500.0, 0.0, 5e-4, "N16_iso_tau500");
+  run_case(16, 1500.0, 0.7, 5e-4, "N16_hg07_tau1500");
 
   std::cout << "done\n";
 }

@@ -484,6 +484,10 @@ static void batchedDoubling(BatchedWorkspace& ws, cudaStream_t stream,
       ws.y_k, ws.z_k, ws.s_up_sol, ws.s_down_sol,
       ws.g_k, ws.gamma_sol);
 
+  // Energy closure of the start
+  batchedRenormalizeEnergyKernel<<<divUp(vec_total, BLOCK), BLOCK, 0, stream>>>(
+      nwav, N, ws.y_k, ws.R_k, ws.T_k);
+
   // --- Doubling iterations ---
   for (int k = 0; k < nn_max; ++k) {
     // tempA = R_k * R_k
@@ -567,6 +571,10 @@ static void batchedDoubling(BatchedWorkspace& ws, cudaStream_t stream,
     // Swap y/z buffers
     std::swap(ws.y_k, ws.y_k2);
     std::swap(ws.z_k, ws.z_k2);
+
+    // Energy closure of the doubled layer (y_k is now y_new)
+    batchedRenormalizeEnergyKernel<<<divUp(vec_total, BLOCK), BLOCK, 0, stream>>>(
+        nwav, N, ws.y_k, ws.R_k, ws.T_k);
 
     // g_k *= 2
     batchedDoubleGkKernel<<<divUp(nwav, BLOCK), BLOCK, 0, stream>>>(nwav, ws.g_k);

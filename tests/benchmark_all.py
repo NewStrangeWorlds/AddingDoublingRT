@@ -190,7 +190,8 @@ def main():
 
     try:
         import jax
-        print(f"JAX precision: {'float64' if jax.config.jax_enable_x64 else 'float32'}")
+        print("JAX precision: float32 (solve_batch core; x64 flag "
+              f"{'on' if jax.config.jax_enable_x64 else 'off'} for the standalone solve)")
         devices = jax.devices()
         for d in devices:
             if d.platform == "gpu":
@@ -210,19 +211,19 @@ def main():
         {"nlay": 50,  "nwav": 1000,  "nmu": 8,  "nmom": 16, "source": "thermal",
          "jax_runs": 3, "label": "Medium (50 layers, 1000 wn, N=8)"},
         {"nlay": 100, "nwav": 20000, "nmu": 8,  "nmom": 16, "source": "thermal",
-         "jax_runs": 1, "label": "Large  (100 layers, 20000 wn, N=8)"},
+         "jax_runs": 3, "label": "Large  (100 layers, 20000 wn, N=8)"},
         {"nlay": 100, "nwav": 20000, "nmu": 4,  "nmom": 8,  "source": "thermal",
-         "jax_runs": 1, "label": "Large  (100 layers, 20000 wn, N=4)"},
+         "jax_runs": 3, "label": "Large  (100 layers, 20000 wn, N=4)"},
         {"nlay": 100, "nwav": 20000, "nmu": 16, "nmom": 32, "source": "thermal",
-         "jax_runs": 1, "label": "Large  (100 layers, 20000 wn, N=16)"},
+         "jax_runs": 3, "label": "Large  (100 layers, 20000 wn, N=16)"},
 
         # --- New source-type configs ---
         {"nlay": 100, "nwav": 20000, "nmu": 8,  "nmom": 16, "source": "thermal",
-         "jax_runs": 1, "label": "Large  thermal  (100 lay, 20k wn, N=8)"},
+         "jax_runs": 3, "label": "Large  thermal  (100 lay, 20k wn, N=8)"},
         {"nlay": 100, "nwav": 20000, "nmu": 8,  "nmom": 16, "source": "solar",
-         "jax_runs": 1, "label": "Large  solar    (100 lay, 20k wn, N=8)"},
+         "jax_runs": 3, "label": "Large  solar    (100 lay, 20k wn, N=8)"},
         {"nlay": 100, "nwav": 20000, "nmu": 8,  "nmom": 16, "source": "mixed",
-         "jax_runs": 1, "label": "Large  mixed    (100 lay, 20k wn, N=8)"},
+         "jax_runs": 3, "label": "Large  mixed    (100 lay, 20k wn, N=8)"},
     ]
 
     # ---- Run C++ / CUDA benchmark ----
@@ -252,16 +253,12 @@ def main():
         jax_runs = c["jax_runs"]
         source = c.get("source", "thermal")
 
-        if nwav_actual > 1000:
-            nwav_bench = 1000
-            atm = build_atmosphere(c["nlay"], nwav_bench, c["nmu"], c["nmom"], source)
-            ms = benchmark_jax_batched(atm, 1)
-            jax_ms = ms * (nwav_actual / nwav_bench)
-            extrapolated = True
-        else:
-            atm = build_atmosphere(c["nlay"], nwav_actual, c["nmu"], c["nmom"], source)
-            jax_ms = benchmark_jax_batched(atm, jax_runs)
-            extrapolated = False
+        # Full size, no extrapolation: solve_batch is dominated by a fixed
+        # launch-latency cost (~0.2 s), so scaling a 1000-wavenumber run
+        # would overstate the large configurations by about 10x.
+        atm = build_atmosphere(c["nlay"], nwav_actual, c["nmu"], c["nmom"], source)
+        jax_ms = benchmark_jax_batched(atm, jax_runs)
+        extrapolated = False
 
         jax_results[label] = {"ms": jax_ms, "extrapolated": extrapolated}
         marker = " *" if extrapolated else ""
@@ -311,7 +308,7 @@ def main():
         print(f"{label:<46} {cpp_ms_str}{cuda_ms_str}{jax_ms_str}{cuda_speedup_str}{jax_speedup_str}")
 
     print()
-    print("* = time extrapolated from smaller subset")
+    print("* = C++ CPU time extrapolated from a smaller subset")
     print("CPU/CUDA, CPU/JAX = speedup relative to C++ CPU (higher is faster)")
     print()
 
